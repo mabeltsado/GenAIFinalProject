@@ -725,23 +725,206 @@ if st.session_state.pipeline_done:
     # ── Evaluation Preview ────────────────────────────────────────────────────
 
     with tab_eval:
-        st.subheader("Evaluation Preview")
-
-        st.markdown("#### Evaluation Rubric")
-        st.caption("Score each output 1–5 on every dimension.")
-        st.dataframe(pd.DataFrame(ev.RUBRIC), use_container_width=True, height=270)
-
-        st.divider()
-
-        st.markdown("#### Classification Test Set")
-        st.caption(
-            "10 held-out synthetic reviews with human-assigned ground-truth labels. "
-            "In live mode, run the classifier on these to measure accuracy."
+        st.subheader("Evaluation Framework")
+        st.markdown(
+            "This evaluation uses transparent rule-based scoring — no external model. "
+            "Every score is derived from checks you can read and verify yourself."
         )
-        st.dataframe(pd.DataFrame(ev.TEST_SET), use_container_width=True, height=300)
+
+        # ── Section 1: Rubric ─────────────────────────────────────────────────
+        st.markdown("### Evaluation Rubric")
+        st.caption(
+            "Six dimensions, each scored 1–5. "
+            "The table shows what each score level means and the typical expected "
+            "score for the baseline vs. the agentic pipeline."
+        )
+
+        rubric_rows = [
+            {
+                "Dimension":         v["dimension"],
+                "Question":          v["question"],
+                "Score 1":           v["score_1"],
+                "Score 3":           v["score_3"],
+                "Score 5":           v["score_5"],
+                "Baseline Typical":  v["baseline_typical"],
+                "Agentic Typical":   v["agentic_typical"],
+            }
+            for v in ev.RUBRIC.values()
+        ]
+        st.dataframe(
+            pd.DataFrame(rubric_rows).set_index("Dimension"),
+            use_container_width=True,
+            height=280,
+        )
 
         st.divider()
 
-        st.markdown("#### Your Scorecard")
-        st.caption("Fill this in after reviewing both outputs in the Baseline Comparison tab.")
-        st.dataframe(pd.DataFrame(ev.blank_rubric_scorecard()), use_container_width=True)
+        # ── Section 2: Built-in test cases ────────────────────────────────────
+        st.markdown("### Built-in Test Cases")
+        st.caption(
+            "5 small clusters of synthetic reviews, each with a known dominant theme. "
+            "Run the evaluation below to see how the pipeline scores on each case."
+        )
+
+        for case in ev.TEST_CASES:
+            with st.expander(f"**{case['case_id']}** — {case['label']}", expanded=False):
+                st.markdown(f"**Expected dominant theme:** `{case['dominant_theme']}`")
+                st.markdown(f"**Expected keywords:** {', '.join(f'`{k}`' for k in case['expected_keywords'])}")
+                st.dataframe(
+                    pd.DataFrame(case["reviews"])[[
+                        "customer_id", "written_explanation",
+                        "recommendation_score_0_to_10", "electricity_plan",
+                    ]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        st.divider()
+
+        # ── Section 3: Run sample evaluation ─────────────────────────────────
+        st.markdown("### Run Sample Evaluation")
+        st.caption(
+            "Runs the full agentic pipeline on each test case in mock mode, "
+            "scores the output on all 6 dimensions, and shows the results."
+        )
+
+        if "eval_results" not in st.session_state:
+            st.session_state.eval_results = None
+
+        if st.button("▶ Run Sample Evaluation", key="run_eval_btn"):
+            eval_results = []
+            prog = st.progress(0)
+            for i, case in enumerate(ev.TEST_CASES):
+                prog.progress((i + 1) / len(ev.TEST_CASES), text=f"Evaluating {case['case_id']}…")
+                case_df = pd.DataFrame(case["reviews"])
+                try:
+                    output = pipeline.run_agent_pipeline(
+                        case_df, product_goal, max_cards=3, use_mock=True
+                    )
+                    result = ev.evaluate_output(output, case)
+                except Exception as exc:
+                    result = {
+                        "case_id":    case["case_id"],
+                        "case_label": case["label"],
+                        "error":      str(exc),
+                        "pct_score":  0,
+                        "scores":     {},
+                    }
+                eval_results.append(result)
+            prog.empty()
+            st.session_state.eval_results = eval_results
+
+        if st.session_state.eval_results:
+            results = st.session_state.eval_results
+
+            # Summary table — one row per test case
+            summary_rows = []
+            for r in results:
+                row = {
+                    "Case":            r.get("case_label", r.get("case_id", "?")),
+                    "Expected Theme":  r.get("dominant_theme", "—"),
+                    "Total":           f"{r.get('total_score', '?')}/{r.get('max_score', '?')}",
+                    "Score %":         f"{r.get('pct_score', 0)}%",
+                }
+                for dim_key, dim_meta in ev.RUBRIC.items():
+                    dim_scores = r.get("scores", {})
+                    row[dim_meta["dimension"]] = dim_scores.get(dim_key, {}).get("score", "—")
+                summary_rows.append(row)
+
+            st.dataframe(
+                pd.DataFrame(summary_rows).set_index("Case"),
+                use_container_width=True,
+            )
+
+            # Per-case detail expandable
+            st.markdown("**Per-case score rationales:**")
+            for r in results:
+                with st.expander(f"{r.get('case_id')} — {r.get('case_label', '')}  ({r.get('pct_score', 0)}%)", expanded=False):
+                    if "error" in r:
+                        st.error(r["error"])
+                        continue
+                    detail_rows = [
+                        {
+                            "Dimension": ev.RUBRIC[k]["dimension"],
+                            "Score":     v["score"],
+                            "Rationale": v["rationale"],
+                        }
+                        for k, v in r.get("scores", {}).items()
+                    ]
+                    st.dataframe(
+                        pd.DataFrame(detail_rows).set_index("Dimension"),
+                        use_container_width=True,
+                        hide_index=False,
+                    )
+
+            # CSV export
+            st.divider()
+            try:
+                import io, csv as csv_mod
+                flat_rows = []
+                for r in results:
+                    row = {
+                        "case_id":        r.get("case_id", ""),
+                        "case_label":     r.get("case_label", ""),
+                        "dominant_theme": r.get("dominant_theme", ""),
+                        "total_score":    r.get("total_score", ""),
+                        "max_score":      r.get("max_score", ""),
+                        "pct_score":      r.get("pct_score", ""),
+                        "evaluated_at":   r.get("evaluated_at", ""),
+                    }
+                    for dim_key, dim_data in r.get("scores", {}).items():
+                        row[f"{dim_key}_score"]     = dim_data.get("score", "")
+                        row[f"{dim_key}_rationale"] = dim_data.get("rationale", "")
+                    flat_rows.append(row)
+
+                buf = io.StringIO()
+                writer = csv_mod.DictWriter(buf, fieldnames=list(flat_rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(flat_rows)
+                st.download_button(
+                    label="⬇ Export Evaluation Results as CSV",
+                    data=buf.getvalue(),
+                    file_name="evaluation_results.csv",
+                    mime="text/csv",
+                )
+            except Exception as exc:
+                st.caption(f"CSV export unavailable: {exc}")
+
+        st.divider()
+
+        # ── Section 4: Baseline vs. Agentic comparison ────────────────────────
+        st.markdown("### Baseline vs. Agentic Comparison")
+        st.caption(
+            "Scores the current session's baseline and agentic outputs side by side. "
+            "Run **▶ Run Baseline** in the Baseline Comparison tab and "
+            "**▶ Run Agent Analysis** first."
+        )
+
+        baseline_out  = st.session_state.baseline_out
+        agentic_ready = st.session_state.pipeline_done
+
+        if not baseline_out or not agentic_ready:
+            missing = []
+            if not baseline_out:
+                missing.append("baseline output (go to **Baseline Comparison** tab → Run Baseline)")
+            if not agentic_ready:
+                missing.append("agentic pipeline output (click **▶ Run Agent Analysis** above)")
+            st.info("Generate both outputs first:\n- " + "\n- ".join(missing))
+        else:
+            agentic_result = {
+                "scored_opportunities": st.session_state.scored_themes,
+                "backlog_cards":        st.session_state.cards,
+                "insights_brief":       st.session_state.brief,
+                "duplicates":           st.session_state.dup_result,
+                "themes":               st.session_state.themes,
+            }
+            comparison = ev.compare_baseline_vs_agentic(baseline_out, agentic_result)
+            comp_df = pd.DataFrame(comparison).set_index("Dimension")
+            st.dataframe(comp_df, use_container_width=True)
+
+            avg_baseline = sum(r["Baseline Score"] for r in comparison) / len(comparison)
+            avg_agentic  = sum(r["Agentic Score"]  for r in comparison) / len(comparison)
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Avg Baseline Score",  f"{avg_baseline:.1f} / 5")
+            c2.metric("Avg Agentic Score",   f"{avg_agentic:.1f} / 5")
+            c3.metric("Avg Improvement",     f"+{avg_agentic - avg_baseline:.1f} pts")
