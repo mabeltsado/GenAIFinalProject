@@ -31,7 +31,13 @@ from datetime import datetime
 
 import pandas as pd
 
-from prompts import SYSTEM_PROMPT, BASELINE_PROMPT
+from prompts import (
+    REVIEW_CLASSIFICATION_SYSTEM_PROMPT,
+    REVIEW_CLASSIFICATION_USER_PROMPT,
+    INSIGHTS_BRIEF_SYSTEM_PROMPT,
+    INSIGHTS_BRIEF_USER_PROMPT,
+    BASELINE_PROMPT,
+)
 from scoring import rank_themes
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -163,7 +169,11 @@ def get_client(api_key: str | None = None):
     return Anthropic(api_key=key)
 
 
-def _llm_call(prompt: str, max_tokens: int = 2048) -> str:
+def _llm_call(
+    prompt: str,
+    max_tokens: int = 2048,
+    system: str = REVIEW_CLASSIFICATION_SYSTEM_PROMPT,
+) -> str:
     """
     Make a single LLM call using the Anthropic API.
 
@@ -178,7 +188,7 @@ def _llm_call(prompt: str, max_tokens: int = 2048) -> str:
     response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=max_tokens,
-        system=SYSTEM_PROMPT,
+        system=system,
         messages=[{"role": "user", "content": prompt}],
     )
     return response.content[0].text
@@ -648,25 +658,15 @@ def _classify_live(df: pd.DataFrame, product_goal: str) -> list[dict]:
         for _, row in df.iterrows()
     ]
 
-    prompt = f"""Classify each customer review for an electricity utility company.
-The product manager's current goal is: {product_goal}
-
-For each review, return a JSON object with exactly these fields:
-  survey_response_id : copy from input
-  issue_category     : one of [billing, digital, outage, service, pricing, plans, green, retention, other]
-  sentiment          : one of [positive, neutral, negative]
-  severity_score     : integer 1 (minor annoyance) to 5 (critical / likely to churn)
-  opportunity_type   : one of {json.dumps(OPPORTUNITY_TYPES)}
-  customer_impact    : one of [individual, widespread]
-  evidence_quote     : verbatim excerpt under 120 characters from written_explanation
-  confidence         : one of [high, medium, low]
-
-Reviews to classify:
-{json.dumps(reviews_input, indent=2)}
-
-Return ONLY a valid JSON array, one object per review, in the same order. No markdown fences."""
-
-    text = _llm_call(prompt, max_tokens=4096)
+    prompt = REVIEW_CLASSIFICATION_USER_PROMPT.format(
+        product_goal=product_goal,
+        reviews_json=json.dumps(reviews_input, indent=2),
+    )
+    text = _llm_call(
+        prompt,
+        max_tokens=4096,
+        system=REVIEW_CLASSIFICATION_SYSTEM_PROMPT,
+    )
     classifications = _parse_json_response(text)
 
     # Merge LLM output with original survey row data
@@ -962,25 +962,64 @@ def _brief_live(ranked_opportunities: list, duplicate_summary: str, product_goal
         {k: v for k, v in t.items() if k != "reviews"}
         for t in ranked_opportunities[:6]
     ]
-    prompt = f"""Write a concise product insights brief for a product manager at an electricity utility.
+    prompt = INSIGHTS_BRIEF_USER_PROMPT.format(
+        product_goal=product_goal,
+        themes_json=json.dumps(slim_themes, indent=2),
+        duplicate_summary=duplicate_summary,
+    )
+    raw = _llm_call(prompt, max_tokens=1200, system=INSIGHTS_BRIEF_SYSTEM_PROMPT)
 
-Product Goal: {product_goal}
-Data quality note: {duplicate_summary}
-
-Scored opportunity themes (sorted highest priority first):
-{json.dumps(slim_themes, indent=2)}
-
-Write in markdown with exactly these sections:
-## Product Insights Brief
-### Executive Summary (2-3 sentences)
-### Top 3 Opportunities (include evidence quotes and why each matters to the business)
-### Recommended Next Steps (3 concrete, sprint-sized actions)
-### Risks & Caveats (include the duplicate note above)
-### ⚠️ Human Review Notes (governance reminder that this is an AI-generated draft)
-
-Be direct and specific. Under 450 words."""
-
-    return _llm_call(prompt, max_tokens=900)
+    # The prompt asks for JSON; render it as a readable markdown brief
+    try:
+        brief_data = _parse_json_response(raw)
+        lines = [
+            "## Product Insights Brief",
+            f"*Goal: **{product_goal}***",
+            "",
+            "---",
+            "### Executive Summary",
+            brief_data.get("executive_summary", ""),
+            "",
+            "---",
+            "### Top Opportunities",
+        ]
+        for opp in brief_data.get("top_opportunities", []):
+            quotes = opp.get("voice_of_customer", "")
+            lines += [
+                f"**{opp.get('name', '')}** ({opp.get('priority_level', '')})",
+                opp.get("why_it_matters", ""),
+                f"> \"{quotes}\"" if quotes else "",
+                "",
+            ]
+        evidence = brief_data.get("evidence", {})
+        if evidence:
+            lines += [
+                "---",
+                "### Evidence",
+                f"- Reviews analyzed: {evidence.get('total_reviews_analyzed', '—')}",
+                f"- Detractor share: {evidence.get('detractor_share', '—')}",
+                f"- Highest severity theme: {evidence.get('highest_severity_theme', '—')}",
+                "",
+            ]
+        steps = brief_data.get("recommended_next_steps", [])
+        if steps:
+            lines += ["---", "### Recommended Next Steps"]
+            for step in steps:
+                lines.append(f"- {step}")
+            lines.append("")
+        risks = brief_data.get("risks_and_caveats", [])
+        if risks:
+            lines += ["---", "### Risks & Caveats"]
+            for r in risks:
+                lines.append(f"- {r}")
+            lines.append("")
+        hr_notes = brief_data.get("human_review_notes", "")
+        if hr_notes:
+            lines += ["---", "### ⚠️ Human Review Notes", hr_notes]
+        return "\n".join(lines)
+    except Exception:
+        # If JSON parsing fails, return raw text as-is
+        return raw
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

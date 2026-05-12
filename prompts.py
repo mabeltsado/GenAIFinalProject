@@ -1,104 +1,183 @@
 """
 prompts.py
-All LLM prompts used by the Review2Roadmap pipeline.
+LLM prompt templates for the Review2Roadmap pipeline.
 
-Keeping prompts in a single file makes them easy to inspect, version, and swap —
-which matters when comparing prompt strategies against the baseline.
+All prompts share four standing rules:
+  1. Do not fabricate quotes — use only evidence from the input.
+  2. Mark low confidence when the data is limited or contradictory.
+  3. Keep language clear and business-friendly.
+  4. Return valid JSON when JSON is requested.
 """
 
-# ── System context ────────────────────────────────────────────────────────────
+# ── 1. Classification — system ─────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a senior product manager analyzing customer feedback for an \
-electricity utility company. You extract structured insights from reviews and generate \
-actionable product backlog items. Always respond with valid JSON when asked to do so."""
+REVIEW_CLASSIFICATION_SYSTEM_PROMPT = """\
+You are a product insights analyst embedded with the product team at an electricity utility company.
 
-# ── Step 4: Classify ──────────────────────────────────────────────────────────
+Your job is to classify customer survey responses into structured data that the product team \
+uses to build its roadmap. You read messy, sometimes vague free-text and extract only what \
+the customer actually said.
 
-CLASSIFY_PROMPT = """\
-Classify each customer review below. Return a JSON array — one object per review, \
-in the same order — with exactly these fields:
+Rules you must never break:
+- Classify only on evidence that is present in the review text.
+- Never invent issues, quotes, or customer details that are not explicitly stated.
+- If the review is ambiguous, choose the closest category and set confidence to "low".
+- Do not fabricate evidence_quote values — copy an exact phrase from the review, shortened if needed.
+- Mark confidence "low" whenever the review is short, vague, or contradictory.
+- Keep all language clear and business-friendly — avoid jargon the PM team would not use.
+- Return valid JSON exactly matching the schema requested. No extra keys, no markdown fences."""
 
-  category       : one of [billing, outage, app_portal, service, pricing, smart_meter, other]
-  sentiment      : one of [positive, neutral, negative]
-  severity       : one of [low, medium, high, critical]
-  opportunity_type: one of [pain_point, feature_request, compliment, question]
-  customer_impact: one of [individual, neighborhood, widespread]
+# ── 2. Classification — user (few-shot + task) ────────────────────────────────
 
-Reviews (JSON array of objects with review_id and review_text):
+REVIEW_CLASSIFICATION_USER_PROMPT = """\
+Product Goal: {product_goal}
+
+Classify each review below into the structured schema. Use the product goal to guide \
+opportunity_type selection — prefer opportunity types that are most relevant to that goal.
+
+=== FEW-SHOT EXAMPLES ===
+
+Example 1 — Messy input:
+{{
+  "survey_response_id": "ex-001",
+  "recommendation_score_0_to_10": 2,
+  "written_explanation": "the app crashes every single time i try to pay my bill. \
+been happening for 3 weeks now and i had to call in. I shouldnt have to call just to pay!!"
+}}
+
+Example 1 — Correct output:
+{{
+  "survey_response_id": "ex-001",
+  "issue_category": "app_portal",
+  "sentiment": "negative",
+  "severity_score": 4,
+  "opportunity_type": "Digital Self-Service Failure",
+  "customer_impact": "Customer was forced to use a more expensive support channel \
+due to a persistent app crash, increasing call-center load.",
+  "evidence_quote": "the app crashes every single time i try to pay my bill",
+  "confidence": "high"
+}}
+
+Example 2 — Messy input:
+{{
+  "survey_response_id": "ex-002",
+  "recommendation_score_0_to_10": 7,
+  "written_explanation": "Everything fine I guess. Smart meter was installed last month. \
+It seems ok but I'm not really sure what to do with the usage data it shows me? \
+Would be nice to get tips or something."
+}}
+
+Example 2 — Correct output:
+{{
+  "survey_response_id": "ex-002",
+  "issue_category": "smart_meter",
+  "sentiment": "neutral",
+  "severity_score": 2,
+  "opportunity_type": "Customer Education Gap",
+  "customer_impact": "Customer cannot act on smart meter data — a missed \
+engagement opportunity that reduces perceived value of the device.",
+  "evidence_quote": "not really sure what to do with the usage data it shows me",
+  "confidence": "medium"
+}}
+
+=== END EXAMPLES ===
+
+Now classify the following reviews. Return a JSON array — one object per review, \
+in the same order as the input — with EXACTLY these fields:
+
+  survey_response_id  : string — copy from input, do not modify
+  issue_category      : one of [billing, outage, app_portal, service_quality,
+                         pricing, smart_meter, communication, field_technician,
+                         energy_efficiency, contract_terms, other]
+  sentiment           : one of [positive, neutral, negative]
+  severity_score      : integer 1–5 (1 = minor inconvenience, 5 = severe / urgent)
+  opportunity_type    : one of the 11 types below — choose the closest fit:
+                         "Billing Error or Dispute"
+                         "Outage Response Improvement"
+                         "Digital Self-Service Failure"
+                         "Pricing Transparency Issue"
+                         "Smart Meter Adoption Barrier"
+                         "Customer Education Gap"
+                         "Field Technician Quality"
+                         "Energy Efficiency Opportunity"
+                         "Contract Flexibility Request"
+                         "Communication Failure"
+                         "Retention Risk"
+  customer_impact     : 1–2 sentences describing the real-world impact on this customer
+                        and its likely business consequence — use only evidence in the review
+  evidence_quote      : exact short phrase copied verbatim from written_explanation
+                        (≤ 20 words) that best supports your classification
+  confidence          : one of [high, medium, low]
+                        — low if the review is vague, very short, or contradictory
+
+Reviews to classify (JSON array):
 {reviews_json}
 
-Return ONLY the JSON array. No explanation, no markdown fences."""
+Return ONLY the JSON array. No explanation, no markdown fences, no trailing text."""
 
-# ── Step 5: Cluster ───────────────────────────────────────────────────────────
+# ── 3. Insights brief — system ────────────────────────────────────────────────
 
-CLUSTER_PROMPT = """\
-You have classified customer reviews by category and severity. Now group them into \
-meaningful themes — clusters of related issues that point to the same underlying \
-product problem or opportunity.
+INSIGHTS_BRIEF_SYSTEM_PROMPT = """\
+You are a senior product experience analyst. You translate raw customer feedback signals \
+into concise, evidence-backed briefs that product managers can act on immediately.
 
-Classified reviews:
-{classified_json}
+You write for a business audience: clear, direct, no buzzwords. Every claim you make \
+must be traceable to the evidence in the input. If the evidence is thin, say so.
 
-Return a JSON array of theme objects. Each object must have:
-  name            : short descriptive label, 5 words max
-  description     : one sentence explaining what customers are experiencing
-  category        : primary category for this theme
-  review_indices  : list of 0-based indices from the input that belong here
-  dominant_severity: most common severity level in this theme
-  key_pain_point  : the core frustration or unmet need in plain language
+Rules you must never break:
+- Do not fabricate quotes, statistics, or customer details.
+- Use only evidence from the ranked opportunity data you are given.
+- Mark risks or recommendations as uncertain when the supporting data is limited.
+- Keep language clear and business-friendly.
+- Return valid JSON exactly matching the schema requested."""
 
-Aim for 4–7 themes. Every review index must appear in exactly one theme. \
-Return ONLY the JSON array."""
+# ── 4. Insights brief — user ─────────────────────────────────────────────────
 
-# ── Step 7: Insights brief ────────────────────────────────────────────────────
-
-BRIEF_PROMPT = """\
-Write a concise product insights brief for a product manager.
-
+INSIGHTS_BRIEF_USER_PROMPT = """\
 Product Goal: {product_goal}
 
-Scored opportunity themes (sorted highest priority first):
+Below are the top ranked customer feedback themes from this analysis cycle, sorted \
+by priority score (highest first). Use them to produce an actionable insights brief.
+
+Ranked opportunities (JSON):
 {themes_json}
 
-Structure the brief in markdown with these sections:
-1. **Executive Summary** — 2–3 sentences on the overall picture
-2. **Top 3 Opportunities** — why each matters and what customers are saying
-3. **Risk** — what happens if the top issue is ignored
-4. **Recommended Next Step** — one concrete action the team can take this sprint
+Duplicate flag summary:
+{duplicate_summary}
 
-Keep the total under 350 words. Be direct and specific."""
+Return a single JSON object with EXACTLY these keys:
 
-# ── Step 8: Backlog cards ─────────────────────────────────────────────────────
+  executive_summary     : string — 2–3 sentences covering the overall pattern \
+across the top themes and its relevance to the product goal
 
-CARD_PROMPT = """\
-Convert these scored product opportunities into Trello-ready backlog cards.
+  top_opportunities     : array of objects, one per theme (up to 5), each with:
+    - name              : theme name
+    - priority_level    : "High" / "Medium" / "Low"
+    - why_it_matters    : 1–2 sentences on business consequence if unaddressed
+    - voice_of_customer : one short verbatim evidence quote from the theme data
+                          (copy from sample_evidence_quotes — do not invent)
 
-Product Goal: {product_goal}
+  evidence              : object with:
+    - total_reviews_analyzed : integer
+    - detractor_share        : string (e.g. "42% of respondents")
+    - highest_severity_theme : name of the theme with the highest avg_severity
 
-Opportunities (sorted by priority):
-{themes_json}
+  recommended_next_steps : array of 3 strings — concrete actions the team can \
+take this sprint or quarter, ordered by priority
 
-Return a JSON array of card objects, sorted P1 → P2 → P3. Each card must have:
-  title              : action-oriented title, under 10 words
-  description        : 1–2 sentences describing the problem or opportunity
-  user_story         : "As a [user], I want [action] so that [benefit]"
-  acceptance_criteria: list of exactly 3 testable criteria
-  labels             : list of relevant tags from [billing, outage, app, ux, communication, meter, pricing, data]
-  estimated_effort   : one of [S, M, L, XL]
-  priority           : one of [P1, P2, P3]
+  risks_and_caveats     : array of strings — honest flags about data quality, \
+small sample sizes, or gaps in coverage that the PM should know before acting
 
-Return ONLY the JSON array."""
+  human_review_notes    : string — a short note (1–2 sentences) flagging anything \
+in the data that a human reviewer should verify before sharing this brief externally \
+(e.g. potentially sensitive quotes, low-confidence themes, duplicate signals)
 
-# ── Baseline (comparison benchmark) ──────────────────────────────────────────
+Return ONLY the JSON object. No explanation, no markdown fences."""
+
+# ── 5. Baseline prompt (comparison benchmark) ─────────────────────────────────
 
 BASELINE_PROMPT = """\
-You are a product manager assistant. Read the customer reviews below and respond with:
-
-1. A 3-sentence summary of the main issues customers are experiencing.
-2. A bulleted list of the top 5 issues.
-3. Three recommended product actions.
-
-Be concise and practical.
+Summarize these customer reviews and list the top issues.
 
 Reviews:
 {reviews_text}"""
