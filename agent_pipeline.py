@@ -138,6 +138,10 @@ _KEYWORD_MAP = {
 # Maps integer severity score (1–5) → string label expected by scoring.py
 _SEVERITY_STR = {1: "low", 2: "low", 3: "medium", 4: "high", 5: "critical"}
 
+# Reviews sent per Anthropic API call. Keeping this small limits token usage per
+# request and means a single bad batch doesn't kill the whole classification run.
+_CLASSIFY_BATCH_SIZE = 10
+
 # Recommended owner area by issue category — used in backlog cards
 _OWNER_AREA = {
     "billing":   "Billing & Revenue",
@@ -154,18 +158,45 @@ _OWNER_AREA = {
 
 # ── LLM client helpers ────────────────────────────────────────────────────────
 
+def _get_api_key() -> str:
+    """
+    Resolve the Anthropic API key without ever exposing it in logs.
+
+    Resolution order:
+      1. st.secrets["ANTHROPIC_API_KEY"] — Streamlit Community Cloud deployment
+      2. ANTHROPIC_API_KEY environment variable — local dev, CI, other hosts
+
+    Returns an empty string (not None) when no key is available so callers
+    can do a simple truthiness check without risking AttributeError.
+    The key value is never printed, logged, or included in error messages.
+    """
+    # Try Streamlit secrets first — only available when running inside Streamlit
+    try:
+        import streamlit as st
+        key = st.secrets.get("ANTHROPIC_API_KEY", "")
+        if key:
+            return key
+    except Exception:
+        pass  # Not running in a Streamlit context, or secrets.toml not configured
+
+    # Fall back to the environment variable (local dev / CI)
+    return os.environ.get("ANTHROPIC_API_KEY", "")
+
+
 def get_client(api_key: str | None = None):
     """
-    Return an Anthropic client.
+    Return an Anthropic client, or None if no key is available.
 
-    Tries the provided key first, then falls back to the ANTHROPIC_API_KEY
-    environment variable. Returns None if neither is available, which causes
-    all LLM steps to fall back to mock mode.
+    Accepts an explicit key (used when the Streamlit sidebar key field is filled).
+    Falls back to _get_api_key() which checks st.secrets then the environment.
+    Returning None causes all LLM steps to fall back to mock mode automatically.
+    The key is passed directly to the SDK — it is never printed or logged.
     """
-    key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+    key = api_key or _get_api_key()
     if not key:
         return None
     from anthropic import Anthropic
+    # The key goes only to the SDK constructor — nowhere else
     return Anthropic(api_key=key)
 
 
@@ -175,19 +206,28 @@ def _llm_call(
     system: str = REVIEW_CLASSIFICATION_SYSTEM_PROMPT,
 ) -> str:
     """
-    Make a single LLM call using the Anthropic API.
+    Make a single Anthropic API call and return the response text.
 
-    Reads the API key from the environment. Raises RuntimeError if no key
-    is configured so the caller can catch and fall back to mock mode.
+    Uses a low temperature (0.2) so that structured JSON outputs are
+    consistent across repeated runs on the same input.
+
+    Raises RuntimeError if no API key is configured — callers are expected
+    to catch this and fall back to mock mode. The error message never
+    includes the key value or any secret material.
     """
     client = get_client()
     if client is None:
+        # Raise so the caller can route to mock — message contains no secrets
         raise RuntimeError(
-            "No Anthropic API key found. Set ANTHROPIC_API_KEY or use use_mock=True."
+            "No Anthropic API key found. "
+            "Set ANTHROPIC_API_KEY in .env or .streamlit/secrets.toml, "
+            "or enable mock mode."
         )
+    # ── LLM call: temperature=0.2 keeps JSON outputs stable and deterministic ──
     response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=max_tokens,
+        temperature=0.2,
         system=system,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -195,7 +235,14 @@ def _llm_call(
 
 
 def _parse_json_response(text: str):
-    """Strip markdown code fences and parse the JSON payload from an LLM response."""
+    """
+    Strip markdown code fences then parse JSON from an LLM response.
+
+    The model is instructed not to wrap output in fences, but it occasionally
+    does anyway. This handles both cases robustly.
+    Raises json.JSONDecodeError if the text is not valid JSON after stripping.
+    """
+    # Remove opening/closing fences — handles ```json...``` and plain ```...```
     text = re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
     return json.loads(text)
 
@@ -517,6 +564,7 @@ def classify_reviews(
     df: pd.DataFrame,
     product_goal: str,
     use_mock: bool = False,
+    warnings: list | None = None,
 ) -> list[dict]:
     """
     Step 4 — Classify each review with structured product intelligence fields.
@@ -526,9 +574,11 @@ def classify_reviews(
         each field. Fast, deterministic, requires no API key.
 
     In live mode (use_mock=False):
-        All reviews are sent in a single batched Anthropic API call.
-        The model returns a JSON array of classifications which are merged back
-        with the original survey fields. Falls back to mock if the API call fails.
+        Reviews are sent in batches of _CLASSIFY_BATCH_SIZE to the Anthropic API.
+        The model returns a JSON array per batch which is merged back with the
+        original survey fields. If no API key is configured, the function
+        automatically switches to mock mode and appends a warning. If a batch's
+        JSON parsing fails, that batch falls back to mock and a warning is appended.
 
     Each classified review includes:
       survey_response_id    — unique identifier
@@ -548,6 +598,9 @@ def classify_reviews(
         The PM's selected product goal (passed to the LLM for context).
     use_mock : bool
         If True, use rule-based classification. If False, call the API.
+    warnings : list | None
+        Mutable list. Non-fatal issues (auto-mock fallback, batch failures)
+        are appended here so the caller can surface them without raising.
 
     Returns
     -------
@@ -557,10 +610,27 @@ def classify_reviews(
     """
     if use_mock:
         return _classify_mock(df, product_goal)
+
+    # ── Check for API key before attempting live mode ─────────────────────────
+    if not _get_api_key():
+        # ── Fallback: no key configured → auto-switch to mock ─────────────────
+        if warnings is not None:
+            warnings.append(
+                "No Anthropic API key found — using rule-based mock classification. "
+                "Add ANTHROPIC_API_KEY to .streamlit/secrets.toml or your environment "
+                "to enable live LLM analysis."
+            )
+        return _classify_mock(df, product_goal)
+
     try:
-        return _classify_live(df, product_goal)
-    except Exception:
-        # Graceful fallback — never leave the pipeline broken
+        return _classify_live(df, product_goal, warnings=warnings)
+    except Exception as exc:
+        # ── Fallback: unexpected error from the API → fall back to mock ───────
+        if warnings is not None:
+            warnings.append(
+                f"LLM classification encountered an unexpected error "
+                f"({type(exc).__name__}) — falling back to rule-based classification."
+            )
         return _classify_mock(df, product_goal)
 
 
@@ -639,57 +709,104 @@ def _classify_mock(df: pd.DataFrame, product_goal: str) -> list[dict]:
     return results
 
 
-def _classify_live(df: pd.DataFrame, product_goal: str) -> list[dict]:
+def _classify_live(
+    df: pd.DataFrame,
+    product_goal: str,
+    warnings: list | None = None,
+) -> list[dict]:
     """
     LLM-based classification via the Anthropic API.
 
-    Sends all reviews in a single prompt for efficiency. The model returns
-    a JSON array with one classification object per review, which is then
-    merged back with the original survey row fields.
+    Reviews are processed in batches of _CLASSIFY_BATCH_SIZE to keep individual
+    API calls small and to isolate failures — if one batch's JSON is unparseable,
+    only that batch falls back to mock; the rest proceed normally.
+
+    Structured output is enforced via the prompt schema in
+    REVIEW_CLASSIFICATION_USER_PROMPT, which lists every field and its allowed
+    values. The model is also instructed to return a bare JSON array with no
+    markdown fences, and _parse_json_response handles any stray fences defensively.
     """
-    # Build a minimal input — only the fields the model needs
-    reviews_input = [
-        {
-            "survey_response_id": str(row.get("survey_response_id", "")),
-            "written_explanation": str(row.get("written_explanation", "")),
-            "nps_score":           int(row.get("recommendation_score_0_to_10", 5)),
-            "electricity_plan":    str(row.get("electricity_plan", "")),
-        }
-        for _, row in df.iterrows()
-    ]
+    rows = list(df.iterrows())
+    all_results: list[dict] = []
 
-    prompt = REVIEW_CLASSIFICATION_USER_PROMPT.format(
-        product_goal=product_goal,
-        reviews_json=json.dumps(reviews_input, indent=2),
-    )
-    text = _llm_call(
-        prompt,
-        max_tokens=4096,
-        system=REVIEW_CLASSIFICATION_SYSTEM_PROMPT,
-    )
-    classifications = _parse_json_response(text)
+    for batch_start in range(0, len(rows), _CLASSIFY_BATCH_SIZE):
+        batch_rows = rows[batch_start : batch_start + _CLASSIFY_BATCH_SIZE]
+        batch_num = batch_start // _CLASSIFY_BATCH_SIZE + 1
 
-    # Merge LLM output with original survey row data
-    results = []
-    for i, (_, row) in enumerate(df.iterrows()):
-        clf = classifications[i] if i < len(classifications) else {}
-        results.append({
-            "survey_response_id":           str(row.get("survey_response_id", "")),
-            "customer_id":                  str(row.get("customer_id", "")),
-            "written_explanation":          str(row.get("written_explanation", "")),
-            "recommendation_score_0_to_10": int(row.get("recommendation_score_0_to_10", 5)),
-            "nps_group":                    str(row.get("nps_group", "")),
-            "electricity_plan":             str(row.get("electricity_plan", "")),
-            "customer_tenure":              str(row.get("customer_tenure", "")),
-            "issue_category":    clf.get("issue_category", "other"),
-            "sentiment":         clf.get("sentiment", "neutral"),
-            "severity_score":    int(clf.get("severity_score", 3)),
-            "opportunity_type":  clf.get("opportunity_type", "billing transparency"),
-            "customer_impact":   clf.get("customer_impact", "individual"),
-            "evidence_quote":    clf.get("evidence_quote", ""),
-            "confidence":        clf.get("confidence", "medium"),
-        })
-    return results
+        # ── Build minimal input — only fields the model needs ─────────────────
+        # PII (name, full address) is deliberately excluded from the prompt;
+        # only the text, score, and plan identifier are sent.
+        reviews_input = [
+            {
+                "survey_response_id": str(row.get("survey_response_id", "")),
+                "written_explanation": str(row.get("written_explanation", "")),
+                "nps_score":           int(row.get("recommendation_score_0_to_10", 5)),
+                "electricity_plan":    str(row.get("electricity_plan", "")),
+            }
+            for _, row in batch_rows
+        ]
+
+        # ── Structured output: prompt enforces the exact JSON schema ──────────
+        # The model is instructed to return a JSON array with one object per
+        # review, in input order, with no extra keys or markdown fences.
+        prompt = REVIEW_CLASSIFICATION_USER_PROMPT.format(
+            product_goal=product_goal,
+            reviews_json=json.dumps(reviews_input, indent=2),
+        )
+
+        try:
+            # ── LLM call: this is where the Anthropic API is invoked ──────────
+            text = _llm_call(
+                prompt,
+                max_tokens=min(4096, 300 * len(batch_rows)),  # scale with batch size
+                system=REVIEW_CLASSIFICATION_SYSTEM_PROMPT,
+            )
+
+            # ── Robust JSON parsing: strip fences, parse, validate type ───────
+            classifications = _parse_json_response(text)
+            if not isinstance(classifications, list):
+                raise ValueError(
+                    f"Model returned {type(classifications).__name__}, expected list"
+                )
+
+        except (json.JSONDecodeError, ValueError, KeyError) as exc:
+            # ── Fallback: JSON parse failed → mock this batch, continue ───────
+            # This keeps the pipeline alive even when one batch produces bad JSON.
+            if warnings is not None:
+                warnings.append(
+                    f"Batch {batch_num}: JSON parsing failed ({type(exc).__name__}: {exc}). "
+                    f"Rule-based mock classification used for {len(batch_rows)} review(s)."
+                )
+            batch_df = pd.DataFrame([row for _, row in batch_rows])
+            all_results.extend(_classify_mock(batch_df, product_goal))
+            continue
+
+        # ── Merge LLM classification with original survey row data ────────────
+        for i, (_, row) in enumerate(batch_rows):
+            clf = classifications[i] if i < len(classifications) else {}
+            # Clamp severity to valid range; default to 3 if missing or non-numeric
+            try:
+                sev = max(1, min(5, int(clf.get("severity_score", 3))))
+            except (TypeError, ValueError):
+                sev = 3
+            all_results.append({
+                "survey_response_id":           str(row.get("survey_response_id", "")),
+                "customer_id":                  str(row.get("customer_id", "")),
+                "written_explanation":          str(row.get("written_explanation", "")),
+                "recommendation_score_0_to_10": int(row.get("recommendation_score_0_to_10", 5)),
+                "nps_group":                    str(row.get("nps_group", "")),
+                "electricity_plan":             str(row.get("electricity_plan", "")),
+                "customer_tenure":              str(row.get("customer_tenure", "")),
+                "issue_category":   clf.get("issue_category", "other"),
+                "sentiment":        clf.get("sentiment", "neutral"),
+                "severity_score":   sev,
+                "opportunity_type": clf.get("opportunity_type", "billing transparency"),
+                "customer_impact":  clf.get("customer_impact", "individual"),
+                "evidence_quote":   clf.get("evidence_quote", ""),
+                "confidence":       clf.get("confidence", "medium"),
+            })
+
+    return all_results
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -851,20 +968,17 @@ def generate_insights_brief(
     duplicate_summary: str,
     product_goal: str,
     use_mock: bool = False,
+    warnings: list | None = None,
 ) -> str:
     """
     Step 7 — Generate a concise, markdown-formatted product insights brief.
 
     In mock mode: builds the brief from scored theme data using a template.
     In live mode: sends the top-ranked themes to Claude and generates a
-                  narrative brief. Falls back to template if the API call fails.
-
-    The brief always includes:
-      - Executive summary
-      - Top 3 opportunities with evidence
-      - Recommended next steps
-      - Risks and caveats (including the duplicate detection note)
-      - Human review notes (governance reminder)
+                  narrative brief using INSIGHTS_BRIEF_USER_PROMPT, which
+                  requests a structured JSON response that is then rendered
+                  as markdown. Falls back to template if no API key is
+                  configured or the API call fails, appending a warning.
 
     Parameters
     ----------
@@ -876,6 +990,8 @@ def generate_insights_brief(
         The PM's selected product goal.
     use_mock : bool
         If True, use template generation. If False, use the Anthropic API.
+    warnings : list | None
+        Mutable list for non-fatal issues (auto-mock fallback, API errors).
 
     Returns
     -------
@@ -884,9 +1000,25 @@ def generate_insights_brief(
     """
     if use_mock:
         return _brief_mock(ranked_opportunities, duplicate_summary, product_goal)
+
+    # ── Check for API key before attempting live mode ─────────────────────────
+    if not _get_api_key():
+        # ── Fallback: no key → template brief ─────────────────────────────────
+        if warnings is not None:
+            warnings.append(
+                "No Anthropic API key found — using template-based insights brief."
+            )
+        return _brief_mock(ranked_opportunities, duplicate_summary, product_goal)
+
     try:
         return _brief_live(ranked_opportunities, duplicate_summary, product_goal)
-    except Exception:
+    except Exception as exc:
+        # ── Fallback: API or JSON error → template brief ──────────────────────
+        if warnings is not None:
+            warnings.append(
+                f"Insights brief generation failed ({type(exc).__name__}) — "
+                "using template-based fallback."
+            )
         return _brief_mock(ranked_opportunities, duplicate_summary, product_goal)
 
 
@@ -907,7 +1039,7 @@ def _brief_mock(ranked_opportunities: list, duplicate_summary: str, product_goal
             f"Analysis of **{total_reviews} customer survey responses** identified "
             f"**{len(ranked_opportunities)} distinct product opportunity themes**. "
             f"The highest-priority area is **{top3[0]['name']}** "
-            f"(score {top3[0]['opportunity_score']}/10), driven by: "
+            f"(score {top3[0]['opportunity_score']}/100), driven by: "
             f"*{top3[0]['key_pain_point'].lower()}*. "
             "Addressing the top two themes is recommended to reduce detractor volume "
             "and protect NPS."
@@ -922,7 +1054,7 @@ def _brief_mock(ranked_opportunities: list, duplicate_summary: str, product_goal
         quote_block = f"\n> \"{quotes[0]}\"" if quotes else ""
         lines += [
             f"**{i}. {t['name']}** — {t.get('priority', '?')} | "
-            f"Score: {t['opportunity_score']}/10 | "
+            f"Score: {t['opportunity_score']}/100 | "
             f"{t['review_count']} reviews | Avg NPS: {t.get('avg_nps_score', '—')}/10",
             f"_{t['key_pain_point']}._{quote_block}",
             "",
@@ -1161,7 +1293,11 @@ def run_agent_pipeline(
         insights_brief       : output of generate_insights_brief
         backlog_cards        : output of generate_backlog_cards
     """
-    result: dict = {"success": False, "errors": []}
+    result: dict = {"success": False, "errors": [], "pipeline_warnings": []}
+    # pipeline_warnings collects non-fatal issues from LLM steps (auto-mock
+    # fallbacks, batch JSON failures) so the app can surface them without
+    # stopping the pipeline.
+    pipeline_warnings: list = result["pipeline_warnings"]
 
     # Step 1 — Validate
     validation = validate_reviews_csv(df)
@@ -1183,28 +1319,31 @@ def run_agent_pipeline(
     result["duplicates"] = duplicates
     df_deduped = duplicates["deduped_df"]
 
-    # Step 4 — Classify
-    classified = classify_reviews(df_deduped, product_goal, use_mock=use_mock)
+    # Step 4 — Classify (LLM or mock; warnings surfaced via pipeline_warnings)
+    classified = classify_reviews(
+        df_deduped, product_goal, use_mock=use_mock, warnings=pipeline_warnings
+    )
     result["classified_reviews"] = classified
 
-    # Step 5 — Cluster
+    # Step 5 — Cluster (deterministic, no LLM)
     themes = cluster_themes(classified)
     result["themes"] = themes
 
-    # Step 6 — Score
+    # Step 6 — Score (deterministic formula, no LLM)
     scored = score_opportunities(themes, product_goal)
     result["scored_opportunities"] = scored
 
-    # Step 7 — Brief
+    # Step 7 — Brief (LLM or mock; warnings surfaced via pipeline_warnings)
     brief = generate_insights_brief(
         scored,
         duplicates["duplicate_summary"],
         product_goal,
         use_mock=use_mock,
+        warnings=pipeline_warnings,
     )
     result["insights_brief"] = brief
 
-    # Step 8 — Cards
+    # Step 8 — Cards (deterministic template, no LLM)
     cards = generate_backlog_cards(scored, max_cards=max_cards)
     result["backlog_cards"] = cards
 
