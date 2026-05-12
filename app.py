@@ -420,31 +420,52 @@ if st.session_state.pipeline_done:
                 left, right = st.columns([5, 1])
 
                 with left:
-                    st.markdown(f"**User Story:** {card.get('user_story', '—')}")
-                    st.markdown(f"**Description:** {card.get('description', '—')}")
+                    st.markdown(f"*{card.get('user_story', '—')}*")
+                    st.divider()
 
-                    criteria = card.get("acceptance_criteria", [])
-                    if criteria:
-                        st.markdown("**Acceptance Criteria:**")
-                        for c in criteria:
-                            st.markdown(f"- {c}")
+                    st.markdown("**Problem**")
+                    st.markdown(card.get("problem", card.get("description", "—")))
 
                     quotes = card.get("evidence_quotes", [])
                     if quotes:
-                        st.markdown("**Evidence Quotes:**")
+                        st.markdown("**Evidence**")
                         for q in quotes:
                             st.markdown(f"> {q}")
+
+                    why = card.get("why_it_matters", "")
+                    if why:
+                        st.markdown("**Why it matters**")
+                        st.markdown(why)
+
+                    action = card.get("recommended_action", "")
+                    if action:
+                        st.markdown("**Recommended action**")
+                        st.markdown(action)
+
+                    sc1, sc2, sc3 = st.columns(3)
+                    sc1.metric("Priority score", f"{card.get('opportunity_score', '—')}/100")
+                    sc2.metric("Confidence", card.get("confidence", "—").title())
+                    sc3.metric("Effort", card.get("estimated_effort", "—"))
+
+                    bd = card.get("score_breakdown_str", "")
+                    if bd:
+                        st.caption(f"Score breakdown: {bd}")
+
+                    criteria = card.get("acceptance_criteria", [])
+                    if criteria:
+                        st.markdown("**Acceptance criteria**")
+                        for c in criteria:
+                            st.markdown(f"- {c}")
 
                     labels = card.get("labels", [])
                     if labels:
                         st.markdown("**Labels:** " + "  ·  ".join(f"`{lbl}`" for lbl in labels))
 
                     st.markdown(
-                        f"**Effort:** `{card.get('estimated_effort', '?')}`  "
-                        f"**Score:** {card.get('opportunity_score', '—')}/100  "
                         f"**Owner:** {card.get('recommended_owner_area', '—')}"
                     )
-                    st.info(card.get("human_review_notes", ""))
+
+                    st.info(f"⚠️ **Human review notes:** {card.get('human_review_notes', '')}")
 
                 with right:
                     checked = st.checkbox(

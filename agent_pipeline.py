@@ -1158,6 +1158,263 @@ def _brief_live(ranked_opportunities: list, duplicate_summary: str, product_goal
 # STEP 8 — Generate Backlog Cards
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Action-oriented card titles, one per opportunity type.
+# Titles describe the fix, not the symptom.
+_CARD_TITLES: dict[str, str] = {
+    "billing transparency":    "Add clearer bill breakdown by fee type",
+    "high bill investigation": "Investigate and resolve unexpected bill spikes",
+    "pricing clarity":         "Clarify variable rate and plan pricing",
+    "renewal education":       "Clarify variable rate renewal messaging",
+    "app improvement":         "Fix mobile app payment and usage failures",
+    "payment reliability":     "Fix autopay and payment processing failures",
+    "outage communication":    "Improve outage restoration status updates",
+    "support experience":      "Reduce call centre hold times with self-service",
+    "plan education":          "Add plan comparison and recommendation tool",
+    "green energy messaging":  "Improve green energy plan transparency",
+    "retention risk":          "Launch proactive outreach for at-risk customers",
+}
+
+# Recommended product or operations action, one per opportunity type.
+_RECOMMENDED_ACTION: dict[str, str] = {
+    "billing transparency": (
+        "Redesign the bill view to show an itemised, fee-by-fee breakdown with "
+        "plain-language labels. Include a year-over-year cost comparison."
+    ),
+    "high bill investigation": (
+        "Audit the top 20 affected accounts, compare meter reads to billing "
+        "records, and identify whether the root cause is a data, estimation, "
+        "or tariff calculation error."
+    ),
+    "pricing clarity": (
+        "Publish a rate comparison table and add a 'What changed this month?' "
+        "explainer to every bill showing the current unit rate and any recent changes."
+    ),
+    "renewal education": (
+        "Send renewal reminder emails 60 and 30 days before contract expiry with "
+        "a clear side-by-side comparison of available plans and their rates."
+    ),
+    "app improvement": (
+        "File bug reports for the top crash paths, prioritise the payment flow fix, "
+        "and add a crash-reporting SDK to catch regressions automatically."
+    ),
+    "payment reliability": (
+        "Add autopay failure notifications via SMS and email with a direct link "
+        "to update payment details before a late fee is applied."
+    ),
+    "outage communication": (
+        "Implement proactive SMS and push notifications at outage start, estimated "
+        "restoration, and final restoration. Add a live outage map to the app."
+    ),
+    "support experience": (
+        "Add a self-service account balance and billing FAQ to the app. Route "
+        "simple enquiries to a guided chatbot to reduce inbound call volume."
+    ),
+    "plan education": (
+        "Build a 3-question plan recommendation tool in the app and customer portal "
+        "that shows personalised comparisons based on a customer's usage history."
+    ),
+    "green energy messaging": (
+        "Add a green energy dashboard showing each customer's renewable percentage, "
+        "carbon offset estimate, and a comparison to local averages."
+    ),
+    "retention risk": (
+        "Trigger a retention workflow when a customer's NPS drops below 6: "
+        "a personal outreach email and a 30-day bill credit offer."
+    ),
+}
+
+# Why this matters to the business, one per opportunity type.
+_WHY_IT_MATTERS: dict[str, str] = {
+    "billing transparency": (
+        "Billing confusion is a leading driver of inbound support calls and a "
+        "common reason customers switch providers. Clearer bills reduce call "
+        "volume and build trust."
+    ),
+    "high bill investigation": (
+        "Unexplained high bills create immediate churn risk and generate "
+        "escalations to regulators. Early detection and resolution prevents "
+        "account losses and reputational damage."
+    ),
+    "pricing clarity": (
+        "Customers who don't understand their rate are more likely to "
+        "over-estimate costs and consider switching. Transparency reduces "
+        "enquiries and improves plan retention."
+    ),
+    "renewal education": (
+        "Customers who miss renewal windows or roll onto default rates often "
+        "leave angry. Proactive education improves contract renewal rates and "
+        "reduces churn at end-of-term."
+    ),
+    "app improvement": (
+        "A broken payment flow forces customers to the call centre, increasing "
+        "cost-to-serve and reducing satisfaction. App stability is a baseline "
+        "expectation for digital-first customers."
+    ),
+    "payment reliability": (
+        "Silent autopay failures create surprise late fees, which are a top "
+        "driver of NPS detractor scores and formal complaints."
+    ),
+    "outage communication": (
+        "Customers are willing to accept outages — they are not willing to "
+        "be left in silence. Poor communication during outages is the single "
+        "biggest driver of post-outage NPS drops."
+    ),
+    "support experience": (
+        "Long hold times erode trust and generate social media complaints. "
+        "Reducing call volume through self-service lowers cost-to-serve and "
+        "improves CSAT scores."
+    ),
+    "plan education": (
+        "Customers on the wrong plan overpay and leave. A recommendation tool "
+        "can reduce churn by matching customers to plans that suit their usage."
+    ),
+    "green energy messaging": (
+        "Green energy customers are among the most loyal segments. Clear "
+        "messaging on environmental impact reinforces the value of premium plans "
+        "and reduces upgrade hesitation."
+    ),
+    "retention risk": (
+        "Customers actively researching competitors are 3-5x more likely to "
+        "churn within 90 days. Early intervention at the first signal of "
+        "dissatisfaction is significantly cheaper than acquisition."
+    ),
+}
+
+# Acceptance criteria, 2-4 items per opportunity type.
+_ACCEPTANCE_CRITERIA: dict[str, list[str]] = {
+    "billing transparency": [
+        "Every bill shows an itemised breakdown of all charges with plain-language labels.",
+        "Customers can view a year-over-year cost comparison on the bill and in the portal.",
+        "Customer-reported billing confusion support tickets decrease by ≥20% within 60 days of launch.",
+    ],
+    "high bill investigation": [
+        "Root cause is identified and documented for the top 20 affected accounts within 2 weeks.",
+        "Affected customers receive a clear written explanation of their bill within 5 business days.",
+        "A detection rule is added to flag accounts with >30% month-over-month bill increases for review.",
+    ],
+    "pricing clarity": [
+        "A rate comparison table is live on the website and in the customer portal.",
+        "Every bill includes a 'What changed this month?' section when the unit rate has changed.",
+        "Pricing-related support enquiries decrease by ≥15% within 60 days.",
+    ],
+    "renewal education": [
+        "Renewal reminder emails are sent at 60 and 30 days before contract end for 100% of contracts.",
+        "Each reminder includes a side-by-side comparison of at least 2 available renewal plans.",
+        "Contract lapse rate (customers rolling to default tariff without choosing) decreases by ≥25%.",
+    ],
+    "app improvement": [
+        "The payment flow completes without error on the 3 most recent iOS and Android versions.",
+        "App crash rate for the payment and usage views drops to <1% within 30 days of the fix.",
+        "A crash-reporting integration is live and alerting on any new crash spike within 24 hours.",
+        "Customer app store rating improves by ≥0.3 stars within 60 days.",
+    ],
+    "payment reliability": [
+        "Autopay failure notifications are sent within 1 hour of a failed charge attempt.",
+        "Each notification includes a direct link to update payment details.",
+        "Late fees issued to customers with a failed autopay notification decrease by ≥40%.",
+    ],
+    "outage communication": [
+        "An SMS or push notification is sent within 15 minutes of any outage affecting >50 customers.",
+        "Estimated restoration time is communicated and updated every 2 hours.",
+        "A final 'power restored' notification is sent when the outage is resolved.",
+        "Post-outage NPS score for affected customers improves by ≥1.5 points in the next survey cycle.",
+    ],
+    "support experience": [
+        "Average call centre hold time decreases by ≥30% within 90 days.",
+        "A self-service account balance check is available in the app without requiring a call.",
+        "Chatbot deflection rate for top-5 enquiry types reaches ≥40% within 60 days.",
+    ],
+    "plan education": [
+        "A plan recommendation tool is available in the app and customer portal.",
+        "The tool asks ≤5 questions and returns a personalised plan comparison.",
+        "Customers who use the tool show a ≥10% lower churn rate at 6-month follow-up.",
+    ],
+    "green energy messaging": [
+        "A green energy dashboard is available showing renewable %, carbon offset, and local comparison.",
+        "Green plan upgrade conversion rate improves by ≥5% within 90 days of dashboard launch.",
+    ],
+    "retention risk": [
+        "A retention workflow is triggered for any customer with NPS <6 within 48 hours.",
+        "Triggered outreach includes a personal email and a defined offer (e.g. bill credit).",
+        "90-day churn rate for customers who receive outreach is ≥20% lower than the control group.",
+    ],
+}
+
+# What the PM should specifically verify before committing, per opportunity type.
+_HUMAN_REVIEW: dict[str, str] = {
+    "billing transparency": (
+        "Confirm whether billing confusion is a UI/presentation problem or a data/calculation "
+        "error — the fix differs significantly. Cross-check with the top 10 billing support "
+        "ticket categories before scoping."
+    ),
+    "high bill investigation": (
+        "Do not ship a fix before root cause is confirmed. Verify whether the issue is "
+        "isolated to specific meter types, plans, or tariff bands. Legal and regulatory "
+        "review may be required before customer communications go out."
+    ),
+    "pricing clarity": (
+        "Check whether rate confusion is driven by marketing/sales promises that differ from "
+        "the actual tariff. Align with the pricing team before publishing any comparison tables."
+    ),
+    "renewal education": (
+        "Confirm the renewal reminder cadence is technically feasible with the current CRM. "
+        "Check whether any regulatory requirements exist for renewal notification timing."
+    ),
+    "app improvement": (
+        "Validate the crash reports with engineering using production logs — "
+        "survey-reported symptoms may point to multiple distinct bugs. Prioritise by "
+        "affected user count, not just NPS impact."
+    ),
+    "payment reliability": (
+        "Check whether autopay failures are caused by bank-side rejections, an internal "
+        "processing error, or expired card handling. The fix and owner team differ by root cause."
+    ),
+    "outage communication": (
+        "Confirm current outage notification infrastructure before committing to timelines. "
+        "Validate that estimated restoration times from grid operations are reliable enough "
+        "to share — inaccurate ETAs may worsen customer experience."
+    ),
+    "support experience": (
+        "Audit the actual top enquiry types from call centre logs — survey data captures "
+        "frustration but may not reflect volume accurately. Confirm chatbot capability "
+        "before committing to deflection targets."
+    ),
+    "plan education": (
+        "Check whether usage history data is available and clean enough to power a "
+        "recommendation engine. Coordinate with legal to ensure plan comparisons meet "
+        "advertising standards."
+    ),
+    "green energy messaging": (
+        "Verify the renewable percentage figures with the energy procurement team before "
+        "publishing — inaccurate green claims carry regulatory and reputational risk."
+    ),
+    "retention risk": (
+        "Define the intervention offer (bill credit amount, duration) with finance before "
+        "building the workflow. Confirm that targeted outreach is permitted under the "
+        "current customer communications policy."
+    ),
+}
+
+# Map opportunity type → allowed Trello labels from the approved label set.
+_LABELS_BY_OPP: dict[str, list[str]] = {
+    "billing transparency":    ["Billing", "Pricing Clarity"],
+    "high bill investigation": ["Billing", "Needs Human Validation"],
+    "pricing clarity":         ["Pricing Clarity", "Billing"],
+    "renewal education":       ["Renewal", "Pricing Clarity"],
+    "app improvement":         ["App Issue"],
+    "payment reliability":     ["Billing", "App Issue"],
+    "outage communication":    ["Outage Communication"],
+    "support experience":      ["Support Experience"],
+    "plan education":          ["Pricing Clarity", "Renewal"],
+    "green energy messaging":  ["Quick Win"],
+    "retention risk":          ["Retention Risk"],
+}
+
+# Labels added based on priority and confidence, regardless of opportunity type.
+_PRIORITY_LABEL   = "High Priority"
+_LOW_CONF_LABEL   = "Needs Human Validation"
+
+
 def generate_backlog_cards(
     ranked_opportunities: list[dict],
     max_cards: int = 5,
@@ -1165,84 +1422,120 @@ def generate_backlog_cards(
     """
     Step 8 — Create Trello-ready backlog card objects from scored opportunities.
 
-    Takes the top N opportunities (controlled by max_cards) and constructs a
-    structured card dict for each. This step is template-based — no LLM call
-    is needed. Evidence quotes, NPS data, and scoring details from previous
-    steps are embedded directly into each card.
+    All content is derived from the scored theme data — no LLM call is made.
+    Evidence quotes are taken verbatim from the classified reviews; nothing
+    is invented. Each card contains all sections needed for the Trello Cards
+    tab and the format_card_description() formatter in trello_client.py.
 
-    Each card includes a human_review_notes field as an explicit governance
-    reminder that the PM must validate the card before committing to roadmap
-    work or sending to Trello.
-
-    Each card object includes:
-      title                  — action-oriented card title with priority label
-      description            — problem summary with supporting data
-      priority               — P1 / P2 / P3
-      labels                 — issue category and opportunity type tags
-      evidence_quotes        — up to 3 verbatim excerpts from reviews
-      confidence             — high / medium / low
+    Card fields
+    -----------
+      title                — action-oriented product title (no priority prefix)
+      priority             — P1 / P2 / P3
+      labels               — from the approved label set, based on type + priority
+      problem              — what customers are experiencing (Problem section)
+      why_it_matters       — customer and business impact (Why it matters section)
+      recommended_action   — concrete product or ops next step
+      evidence_quotes      — up to 3 verbatim quotes from classified reviews
+      acceptance_criteria  — 2–4 testable, outcome-based criteria
+      human_review_notes   — what the PM should verify before roadmapping
+      confidence           — high / medium / low
+      opportunity_score    — 0–100 priority score
+      score_breakdown      — per-dimension scores from scoring.py
+      estimated_effort     — S / M / L derived from priority
+      user_story           — "As a customer..." one-liner
       recommended_owner_area — team most likely responsible
-      acceptance_criteria    — 3 testable, outcome-based criteria
-      human_review_notes     — governance reminder with confidence level
-      estimated_effort       — S / M / L (derived from priority)
-      user_story             — "As a customer..." format for Trello description
+      affected_plans       — which electricity plans are affected
+      description          — alias of problem (backward compatibility)
 
     Parameters
     ----------
     ranked_opportunities : list[dict]
         Scored output from score_opportunities().
     max_cards : int
-        Maximum number of cards to generate (controlled by the sidebar setting).
+        Maximum number of cards to generate.
 
     Returns
     -------
     list[dict]
-        Card objects sorted P1 → P2 → P3 (inherits the ranked order).
+        Card objects in priority order (inherits ranked sort).
     """
     _EFFORT = {"P1": "L", "P2": "M", "P3": "S"}
-    top = ranked_opportunities[:max_cards]
+    top   = ranked_opportunities[:max_cards]
     cards = []
 
     for t in top:
-        category  = t.get("issue_category", "other")
-        priority  = t.get("priority", "P3")
-        opp_type  = t.get("opportunity_type", "")
-        quotes    = t.get("sample_evidence_quotes", [])
-        plans     = t.get("affected_plans", [])
-        plan_str  = ", ".join(plans[:2]) if plans else "standard"
-        conf      = t.get("confidence_level", "medium")
+        opp_type = t.get("opportunity_type", "")
+        category = t.get("issue_category", "other")
+        priority = t.get("priority", "P3")
+        conf     = t.get("confidence_level", "medium")
+        quotes   = t.get("sample_evidence_quotes", [])[:3]
+        plans    = t.get("affected_plans", [])
+        plan_str = ", ".join(plans[:2]) if plans else "standard"
+        score    = t.get("opportunity_score", 0)
+        breakdown = t.get("score_breakdown", {})
+
+        # Title: from lookup table, fall back to a generic action phrase
+        title = _CARD_TITLES.get(
+            opp_type,
+            f"Resolve {opp_type.replace('_', ' ').title()} issues",
+        )
+
+        # Labels: start from the type-based set, then add priority/confidence labels
+        base_labels = list(_LABELS_BY_OPP.get(opp_type, [category.title()]))
+        if priority == "P1" and _PRIORITY_LABEL not in base_labels:
+            base_labels.insert(0, _PRIORITY_LABEL)
+        if conf == "low" and _LOW_CONF_LABEL not in base_labels:
+            base_labels.append(_LOW_CONF_LABEL)
+
+        # Problem: combine the key pain point with supporting data
+        review_count  = t.get("review_count", 0)
+        avg_nps       = t.get("avg_nps_score", "—")
+        detractors    = t.get("detractor_count", 0)
+        problem = (
+            f"{review_count} customer{'s' if review_count != 1 else ''} reported "
+            f"issues with {opp_type.replace('_', ' ')}. "
+            f"{t.get('key_pain_point', '')}. "
+            f"Average NPS for this group: {avg_nps}/10 "
+            f"({detractors} detractor{'s' if detractors != 1 else ''})."
+        )
+
+        # Score breakdown string for display
+        bd_str = "  ·  ".join(
+            f"{k.replace('_', ' ').title()}: {v}/5"
+            for k, v in breakdown.items()
+        ) if breakdown else ""
 
         cards.append({
-            "title": f"[{priority}] Resolve: {t['name']}",
-            "description": (
-                f"{t['review_count']} customers reported issues with **{opp_type}**. "
-                f"Core pain point: {t['key_pain_point']}. "
-                f"Average NPS for this group: {t.get('avg_nps_score', '—')}/10."
-            ),
-            "priority": priority,
-            "labels": sorted({category, opp_type.replace(" ", "-")}),
-            "evidence_quotes": quotes,
-            "confidence": conf,
-            "opportunity_score": t.get("opportunity_score", 0),
+            "title":              title,
+            "priority":           priority,
+            "labels":             base_labels,
+            "problem":            problem,
+            "why_it_matters":     _WHY_IT_MATTERS.get(opp_type, t.get("key_pain_point", "")),
+            "recommended_action": _RECOMMENDED_ACTION.get(opp_type, ""),
+            "evidence_quotes":    quotes,
+            "acceptance_criteria": _ACCEPTANCE_CRITERIA.get(opp_type, [
+                f"The issue is resolved for ≥95% of affected customers.",
+                f"Customer-reported {category} issues decrease by ≥20% within 60 days.",
+                f"NPS for this theme improves by ≥1.0 point in the next survey cycle.",
+            ]),
+            "human_review_notes": _HUMAN_REVIEW.get(opp_type, (
+                f"AI-generated draft — confidence: {conf}. Validate against support "
+                "ticket data and product analytics before adding to the roadmap."
+            )),
+            "confidence":             conf,
+            "opportunity_score":      score,
+            "score_breakdown":        breakdown,
+            "score_breakdown_str":    bd_str,
+            "estimated_effort":       _EFFORT.get(priority, "M"),
             "recommended_owner_area": _OWNER_AREA.get(category, "Product"),
-            "affected_plans": plans,
-            "acceptance_criteria": [
-                f"The {opp_type} experience is resolved for ≥95% of affected customers.",
-                f"Customer-reported {category} issues decrease by ≥20% within 60 days of launch.",
-                f"NPS for the '{opp_type}' theme improves by ≥1.0 point in the next survey cycle.",
-            ],
-            "human_review_notes": (
-                f"⚠️ AI-generated draft — confidence: {conf}. "
-                "Validate findings with support ticket data and product analytics "
-                "before adding to the roadmap or sending to Trello."
-            ),
-            "estimated_effort": _EFFORT.get(priority, "M"),
-            # user_story used by trello_client.py when formatting the card description
+            "affected_plans":         plans,
             "user_story": (
                 f"As a customer on the {plan_str} plan, "
-                f"I want {t['key_pain_point'].rstrip('.').lower()} "
+                f"I want {t.get('key_pain_point', '').rstrip('.').lower()} "
                 "so that I can trust my electricity provider."
             ),
+            # Backward-compatible alias used by older callers
+            "description": problem,
         })
 
     return cards
