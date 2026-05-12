@@ -32,6 +32,23 @@ SAMPLE_DATA_PATH = os.path.join("data", "fake_electricity_customer_reviews_500.c
 # Pull required columns directly from the pipeline so there's one source of truth.
 REQUIRED_COLUMNS = pipeline.REQUIRED_COLUMNS
 
+
+# ── Credential resolution (startup, never displayed) ─────────────────────────
+
+def _secret_configured(key: str) -> bool:
+    """Return True if a secret is set in st.secrets or the environment. Never returns the value."""
+    try:
+        if st.secrets.get(key, ""):
+            return True
+    except Exception:
+        pass
+    return bool(os.environ.get(key, ""))
+
+
+_ANTHROPIC_CONFIGURED = _secret_configured("ANTHROPIC_API_KEY")
+_TRELLO_CONFIGURED    = trello_config_available()
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
@@ -56,20 +73,37 @@ with st.sidebar:
         step=1,
     )
 
-    mock_mode = st.checkbox("Use mock mode instead of live LLM", value=True)
+    mock_mode = st.checkbox(
+        "Use mock mode instead of live LLM",
+        value=not _ANTHROPIC_CONFIGURED,
+        disabled=not _ANTHROPIC_CONFIGURED,
+        help=(
+            "Mock mode uses keyword heuristics — no API key required."
+            if not _ANTHROPIC_CONFIGURED
+            else "Uncheck to call the live Anthropic API."
+        ),
+    )
 
-    if not mock_mode:
-        anthropic_key = st.text_input(
-            "Anthropic API key",
-            type="password",
-            # Pre-fill from secrets if available — value is never displayed in plain text
-            value=st.secrets.get("ANTHROPIC_API_KEY", ""),
-        )
-        # Write to env only — key is never echoed to logs or UI elements
-        if anthropic_key:
-            os.environ["ANTHROPIC_API_KEY"] = anthropic_key
+    st.divider()
+
+    # ── Integration status (configured / not configured only — no key values) ─
+    st.markdown("**Integration status**")
+
+    if _ANTHROPIC_CONFIGURED:
+        st.success("Anthropic API: ✅ Configured")
     else:
-        anthropic_key = ""
+        st.warning(
+            "Anthropic API not configured — mock mode will be used. "
+            "Add `ANTHROPIC_API_KEY` to `.streamlit/secrets.toml` to enable live analysis."
+        )
+
+    if _TRELLO_CONFIGURED:
+        st.success("Trello: ✅ Configured")
+    else:
+        st.info(
+            "Trello is not configured. Add `TRELLO_API_KEY`, `TRELLO_TOKEN`, and "
+            "`TRELLO_LIST_ID` to `.streamlit/secrets.toml` to enable card creation."
+        )
 
     st.divider()
 
