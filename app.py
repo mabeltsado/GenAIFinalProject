@@ -12,7 +12,12 @@ import streamlit as st
 
 import agent_pipeline as pipeline
 import evaluation as ev
-from trello_client import TrelloClient, is_configured as trello_ready, mock_create_card
+from trello_client import (
+    TrelloClient,
+    trello_config_available,
+    get_default_list_id,
+    format_card_description,
+)
 
 # ── Page config ───────────────────────────────────────────────────────────────
 
@@ -405,6 +410,8 @@ if st.session_state.pipeline_done:
         )
 
         cards = st.session_state.cards or []
+
+        # ── Card review with individual approval checkboxes ───────────────────
         for i, card in enumerate(cards):
             icon     = "✅" if i in st.session_state.approved else "⬜"
             priority = card.get("priority", "?")
@@ -430,15 +437,13 @@ if st.session_state.pipeline_done:
 
                     labels = card.get("labels", [])
                     if labels:
-                        st.markdown("**Labels:** " + "  ·  ".join(f"`{l}`" for l in labels))
+                        st.markdown("**Labels:** " + "  ·  ".join(f"`{lbl}`" for lbl in labels))
 
                     st.markdown(
                         f"**Effort:** `{card.get('estimated_effort', '?')}`  "
-                        f"**Score:** {card.get('opportunity_score', '—')}  "
+                        f"**Score:** {card.get('opportunity_score', '—')}/100  "
                         f"**Owner:** {card.get('recommended_owner_area', '—')}"
                     )
-
-                    # Governance reminder embedded in each card
                     st.info(card.get("human_review_notes", ""))
 
                 with right:
@@ -452,61 +457,148 @@ if st.session_state.pipeline_done:
                     else:
                         st.session_state.approved.discard(i)
 
-        st.divider()
-        st.subheader("Send to Trello")
-
-        with st.expander("Trello credentials (optional)", expanded=False):
-            trello_key   = st.text_input("API Key",  type="password", key="tk",
-                                         value=st.secrets.get("TRELLO_API_KEY", ""))
-            trello_token = st.text_input("Token",    type="password", key="tt",
-                                         value=st.secrets.get("TRELLO_TOKEN", ""))
-            trello_board = st.text_input("Board ID", key="tb",
-                                         value=st.secrets.get("TRELLO_BOARD_ID", ""))
-            trello_list  = st.text_input("List ID (Backlog)", key="tl",
-                                         value=st.secrets.get("TRELLO_LIST_ID", ""))
-
-        # Widget keys are mirrored in session_state — read from there so the
-        # values are available outside the expander after it collapses.
-        trello_configured = trello_ready(
-            st.session_state.get("tk", ""),
-            st.session_state.get("tt", ""),
-            st.session_state.get("tb", ""),
-            st.session_state.get("tl", ""),
-        )
-
         n_approved = len(st.session_state.approved)
-        if n_approved == 0:
-            st.caption("Approve at least one card above to enable sending.")
 
-        if st.button(f"📤 Send {n_approved} Approved Card(s) to Trello", disabled=(n_approved == 0)):
-            approved_cards = [cards[i] for i in sorted(st.session_state.approved)]
-            results = []
+        st.divider()
 
-            if trello_configured:
-                trello = TrelloClient(
-                    st.session_state.get("tk", ""),
-                    st.session_state.get("tt", ""),
-                    st.session_state.get("tb", ""),
-                )
-                for card in approved_cards:
-                    results.append(trello.create_card(card, list_id=st.session_state.get("tl", "")))
+        # ── Path A: Trello not configured → setup instructions + CSV export ───
+        if not trello_config_available():
+            st.subheader("Trello Not Configured")
+            st.info(
+                "To send cards directly to Trello, add these credentials to "
+                "`.streamlit/secrets.toml`:\n\n"
+                "```toml\n"
+                'TRELLO_API_KEY = "your-key"\n'
+                'TRELLO_TOKEN   = "your-token"\n'
+                'TRELLO_LIST_ID = "your-list-id"\n'
+                "```\n\n"
+                "Get your key and token at **https://trello.com/app-key**. "
+                "Use the list ID helper below to find the correct list ID."
+            )
+
+            st.markdown("**In the meantime, export your approved cards as CSV:**")
+
+            if n_approved == 0:
+                st.caption("Approve at least one card above to enable export.")
             else:
+                approved_cards = [cards[i] for i in sorted(st.session_state.approved)]
+                export_rows = [
+                    {
+                        "title":               c.get("title", ""),
+                        "priority":            c.get("priority", ""),
+                        "user_story":          c.get("user_story", ""),
+                        "description":         c.get("description", ""),
+                        "acceptance_criteria": " | ".join(c.get("acceptance_criteria", [])),
+                        "evidence_quotes":     " | ".join(c.get("evidence_quotes", [])),
+                        "labels":              ", ".join(c.get("labels", [])),
+                        "estimated_effort":    c.get("estimated_effort", ""),
+                        "opportunity_score":   c.get("opportunity_score", ""),
+                        "recommended_owner":   c.get("recommended_owner_area", ""),
+                    }
+                    for c in approved_cards
+                ]
+                st.download_button(
+                    label=f"⬇ Download {n_approved} Approved Card(s) as CSV",
+                    data=pd.DataFrame(export_rows).to_csv(index=False),
+                    file_name="backlog_cards.csv",
+                    mime="text/csv",
+                )
+
+        # ── Path B: Trello configured → helper + send ─────────────────────────
+        else:
+            # Helper: fetch boards and lists to find the correct list ID
+            with st.expander(
+                "🔍 Find your Trello list ID",
+                expanded=(not get_default_list_id()),
+            ):
+                st.caption(
+                    "Use this to look up the list ID you want cards sent to, "
+                    "then add it as `TRELLO_LIST_ID` in your secrets."
+                )
+
+                if st.button("Fetch my Trello boards"):
+                    client = TrelloClient()
+                    boards = client.get_boards()
+                    if boards and "error" not in boards[0]:
+                        st.session_state["_trello_boards"] = {
+                            b["name"]: b["id"] for b in boards
+                        }
+                    else:
+                        st.error(boards[0].get("error", "Could not fetch boards."))
+
+                if "_trello_boards" in st.session_state:
+                    board_names = list(st.session_state["_trello_boards"].keys())
+                    selected_board = st.selectbox(
+                        "Select a board", board_names, key="_trello_board_sel"
+                    )
+                    selected_board_id = st.session_state["_trello_boards"][selected_board]
+
+                    if st.button("Fetch lists for this board"):
+                        client = TrelloClient()
+                        lists = client.get_lists(selected_board_id)
+                        if lists and "error" not in lists[0]:
+                            st.session_state["_trello_lists"] = lists
+                        else:
+                            st.error(lists[0].get("error", "Could not fetch lists."))
+
+                    if "_trello_lists" in st.session_state:
+                        st.markdown("**Lists on this board** — copy the ID of the list you want:")
+                        for lst in st.session_state["_trello_lists"]:
+                            col_name, col_id = st.columns([2, 3])
+                            col_name.markdown(f"**{lst['name']}**")
+                            col_id.code(lst["id"])
+                        st.caption(
+                            "Add the chosen ID as `TRELLO_LIST_ID` in `.streamlit/secrets.toml`, "
+                            "then reload the app."
+                        )
+
+            # Send approved cards to Trello
+            st.subheader("Send to Trello")
+
+            list_id = get_default_list_id()
+            if not list_id:
+                st.warning(
+                    "`TRELLO_LIST_ID` is not set. "
+                    "Use the finder above to locate your list ID, then add it to secrets."
+                )
+
+            if n_approved == 0:
+                st.caption("Approve at least one card above to enable sending.")
+
+            send_disabled = n_approved == 0 or not list_id
+            if st.button(
+                f"📤 Send {n_approved} Approved Card(s) to Trello",
+                disabled=send_disabled,
+                type="primary",
+            ):
+                approved_cards = [cards[i] for i in sorted(st.session_state.approved)]
+                client = TrelloClient()
+                successes: list[dict] = []
+                failures:  list[tuple[str, str]] = []
+
                 for card in approved_cards:
-                    results.append(mock_create_card(card))
+                    result = client.create_card(
+                        list_id=list_id,
+                        name=card.get("title", "Untitled"),
+                        description=format_card_description(card),
+                        labels=card.get("labels"),
+                    )
+                    if result.get("success"):
+                        successes.append(result)
+                    else:
+                        failures.append(
+                            (card.get("title", "?"), result.get("error", "Unknown error"))
+                        )
 
-            successes = [r for r in results if r.get("success")]
-            failures  = [r for r in results if not r.get("success")]
-
-            if successes:
-                label = "" if trello_configured else " (mock — Trello not configured)"
-                st.success(f"✅ {len(successes)} card(s) sent{label}!")
-                for r in successes:
-                    if r.get("url") and "mock" not in r["url"]:
-                        st.markdown(f"- {r['url']}")
-            if failures:
-                st.error(f"❌ {len(failures)} card(s) failed.")
-                for r in failures:
-                    st.caption(r.get("error", "Unknown error"))
+                if successes:
+                    st.success(f"✅ {len(successes)} card(s) created in Trello!")
+                    for r in successes:
+                        if r.get("url"):
+                            st.markdown(f"- [{r['url']}]({r['url']})")
+                if failures:
+                    st.error(f"❌ {len(failures)} card(s) failed.")
+                    for title, err in failures:
+                        st.caption(f"**{title}**: {err}")
 
     # ── Baseline Comparison ───────────────────────────────────────────────────
 

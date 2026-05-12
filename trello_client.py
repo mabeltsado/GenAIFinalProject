@@ -1,63 +1,74 @@
 """
 trello_client.py
-Thin wrapper around the Trello REST API.
+Simple Trello REST API client for Review2Roadmap.
 
-Requires TRELLO_API_KEY, TRELLO_TOKEN, and TRELLO_BOARD_ID.
-When credentials are missing the client operates in mock mode and returns
-fake success responses so the rest of the app can still be demonstrated.
+Credentials are read from st.secrets (Streamlit Cloud) first, then from
+environment variables. They are never hardcoded, printed, or logged.
+All methods return structured dicts and never raise — callers can check
+the 'error' key without wrapping in try/except.
 """
 
+import os
 import requests
 
 _BASE = "https://api.trello.com/1"
 
 
-class TrelloClient:
-    def __init__(self, api_key: str, token: str, board_id: str):
-        self.api_key = api_key
-        self.token = token
-        self.board_id = board_id
-        self._auth = {"key": api_key, "token": token}
+# ── Credential helpers ────────────────────────────────────────────────────────
 
-    # ── Read ──────────────────────────────────────────────────────────────────
-
-    def get_board_lists(self) -> list[dict]:
-        """Return all lists on the configured board."""
-        url = f"{_BASE}/boards/{self.board_id}/lists"
-        resp = requests.get(url, params=self._auth, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
-
-    # ── Write ─────────────────────────────────────────────────────────────────
-
-    def create_card(self, card: dict, list_id: str) -> dict:
-        """
-        POST a backlog card dict to Trello.
-        Returns {"success": True, "url": ..., "id": ...}
-             or {"success": False, "error": ...}.
-        """
-        payload = {
-            **self._auth,
-            "name": card.get("title", "Untitled card"),
-            "desc": _format_description(card),
-            "idList": list_id,
-            "pos": "bottom",
-        }
-        try:
-            resp = requests.post(f"{_BASE}/cards", data=payload, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-            return {"success": True, "url": data.get("shortUrl", ""), "id": data.get("id")}
-        except requests.HTTPError as exc:
-            return {"success": False, "error": f"HTTP {exc.response.status_code}: {exc.response.text[:200]}"}
-        except Exception as exc:
-            return {"success": False, "error": str(exc)}
+def _get_credentials() -> tuple[str, str]:
+    """
+    Read TRELLO_API_KEY and TRELLO_TOKEN from st.secrets (Streamlit Cloud)
+    then fall back to environment variables.
+    Returns ("", "") if neither source has both values.
+    Credentials are passed directly to requests — never printed or logged.
+    """
+    try:
+        import streamlit as st
+        key   = st.secrets.get("TRELLO_API_KEY", "")
+        token = st.secrets.get("TRELLO_TOKEN", "")
+        if key and token:
+            return key, token
+    except Exception:
+        pass  # Not in a Streamlit context, or secrets.toml not configured
+    return (
+        os.environ.get("TRELLO_API_KEY", ""),
+        os.environ.get("TRELLO_TOKEN", ""),
+    )
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+def trello_config_available() -> bool:
+    """Return True if TRELLO_API_KEY and TRELLO_TOKEN are both set."""
+    key, token = _get_credentials()
+    return bool(key and token)
 
-def _format_description(card: dict) -> str:
-    """Build a Trello card description from the backlog card dict."""
+
+def get_default_list_id() -> str:
+    """
+    Read TRELLO_LIST_ID from st.secrets or environment variables.
+    Returns an empty string if the value is not set — callers should check
+    for a truthy value before attempting to create cards.
+    """
+    try:
+        import streamlit as st
+        val = st.secrets.get("TRELLO_LIST_ID", "")
+        if val:
+            return val
+    except Exception:
+        pass
+    return os.environ.get("TRELLO_LIST_ID", "")
+
+
+# ── Card formatting ───────────────────────────────────────────────────────────
+
+def format_card_description(card: dict) -> str:
+    """
+    Format a backlog card dict into a Trello card description.
+
+    Uses Trello's markdown-like syntax. Evidence quotes and acceptance
+    criteria are always included. The governance reminder is appended
+    at the bottom as a reminder that this is an AI-generated draft.
+    """
     lines = [
         f"**{card.get('user_story', '')}**",
         "",
@@ -68,27 +79,136 @@ def _format_description(card: dict) -> str:
     for criterion in card.get("acceptance_criteria", []):
         lines.append(f"- {criterion}")
 
+    quotes = card.get("evidence_quotes", [])
+    if quotes:
+        lines += ["", "**Customer Evidence**"]
+        for q in quotes[:3]:
+            lines.append(f'> "{q}"')
+
     lines += [
         "",
-        f"**Effort:** {card.get('estimated_effort', '?')}  |  "
-        f"**Priority:** {card.get('priority', '?')}  |  "
+        (
+            f"**Effort:** {card.get('estimated_effort', '?')}  |  "
+            f"**Score:** {card.get('opportunity_score', '—')}/100  |  "
+            f"**Owner:** {card.get('recommended_owner_area', '—')}"
+        ),
         f"**Labels:** {', '.join(card.get('labels', []))}",
         "",
+        "---",
+        "⚠️ *AI-generated draft — validate against support data before "
+        "committing to the roadmap.*",
         "_Generated by Review2Roadmap_",
     ]
     return "\n".join(lines)
 
 
-def is_configured(api_key: str, token: str, board_id: str, list_id: str) -> bool:
-    """Return True only when all four Trello credentials are present."""
-    return all([api_key, token, board_id, list_id])
+# ── TrelloClient ──────────────────────────────────────────────────────────────
 
+class TrelloClient:
+    """
+    Thin wrapper around the Trello REST API.
 
-def mock_create_card(card: dict) -> dict:
-    """Fake success response used when Trello credentials are not configured."""
-    return {
-        "success": True,
-        "url": "https://trello.com/c/mock",
-        "id": "mock-id",
-        "mock": True,
-    }
+    Credentials are resolved at construction: explicit api_key / token
+    arguments take precedence over secrets / environment variables.
+    All methods return structured dicts and do not raise on API errors.
+    """
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        token:   str | None = None,
+    ):
+        if api_key and token:
+            self._auth = {"key": api_key, "token": token}
+        else:
+            k, t = _get_credentials()
+            self._auth = {"key": k, "token": t}
+
+    # ── Read ──────────────────────────────────────────────────────────────────
+
+    def get_boards(self) -> list[dict]:
+        """
+        Return available Trello boards for the authenticated user.
+        Each item has at least 'id' and 'name'.
+        On error, returns a single-item list with an 'error' key.
+        """
+        try:
+            resp = requests.get(
+                f"{_BASE}/members/me/boards",
+                params={**self._auth, "fields": "id,name", "filter": "open"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except requests.HTTPError as exc:
+            return [{"error": f"HTTP {exc.response.status_code}: {exc.response.text[:200]}"}]
+        except Exception as exc:
+            return [{"error": str(exc)}]
+
+    def get_lists(self, board_id: str) -> list[dict]:
+        """
+        Return lists for a selected board.
+        Each item has at least 'id' and 'name'.
+        On error, returns a single-item list with an 'error' key.
+        """
+        try:
+            resp = requests.get(
+                f"{_BASE}/boards/{board_id}/lists",
+                params={**self._auth, "fields": "id,name", "filter": "open"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except requests.HTTPError as exc:
+            return [{"error": f"HTTP {exc.response.status_code}: {exc.response.text[:200]}"}]
+        except Exception as exc:
+            return [{"error": str(exc)}]
+
+    # ── Write ─────────────────────────────────────────────────────────────────
+
+    def create_card(
+        self,
+        list_id:     str,
+        name:        str,
+        description: str,
+        labels:      list[str] | None = None,
+    ) -> dict:
+        """
+        Create a Trello card in the selected list.
+
+        Parameters
+        ----------
+        list_id     : Trello list ID (from get_lists or TRELLO_LIST_ID secret)
+        name        : Card title
+        description : Card body — use format_card_description() to generate this
+        labels      : Optional list of label name strings (informational only;
+                      Trello label IDs would be needed to apply colours)
+
+        Returns
+        -------
+        {"success": True,  "url": "https://trello.com/c/...", "id": "..."}
+        {"success": False, "error": "..."}
+        """
+        payload = {
+            **self._auth,
+            "name":   name,
+            "desc":   description,
+            "idList": list_id,
+            "pos":    "bottom",
+        }
+        try:
+            resp = requests.post(f"{_BASE}/cards", data=payload, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            return {
+                "success": True,
+                "url":     data.get("shortUrl", ""),
+                "id":      data.get("id", ""),
+            }
+        except requests.HTTPError as exc:
+            return {
+                "success": False,
+                "error": f"HTTP {exc.response.status_code}: {exc.response.text[:200]}",
+            }
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
