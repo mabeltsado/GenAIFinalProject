@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Secrets — never commit these
+.streamlit/secrets.toml
+.env
+*.pem
+*.key
+
+# Data — keep raw CSVs local
+data/*.csv
+data/*.xlsx
+outputs/*.csv
+outputs/*.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
