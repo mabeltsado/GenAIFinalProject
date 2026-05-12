@@ -362,8 +362,8 @@ if st.session_state.pipeline_done:
     with tab_opps:
         st.subheader("Prioritized Opportunities")
         st.caption(
-            "Weighted opportunity score (1–10): "
-            "Frequency 25% · Severity 30% · Business Impact 20% · Confidence 15% · NPS Risk 10%"
+            "Weighted opportunity score (0–100): weights are goal-specific "
+            "(Frequency · Severity · NPS Risk · Business Impact · Confidence)"
         )
 
         opp_rows = [

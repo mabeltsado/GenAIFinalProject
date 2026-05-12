@@ -837,20 +837,7 @@ def score_opportunities(theme_clusters: list[dict], product_goal: str) -> list[d
             sev_int = int(review.get("severity_score", 3))
             review["severity"] = _SEVERITY_STR.get(sev_int, "medium")
 
-    ranked = rank_themes(theme_clusters)
-
-    # Goal-alignment bonus: a small nudge so on-goal themes surface higher
-    goal_words = set(product_goal.lower().split())
-    for theme in ranked:
-        opp_words = set(theme.get("opportunity_type", "").lower().split())
-        if goal_words & opp_words:
-            theme["opportunity_score"] = round(
-                min(10.0, theme.get("opportunity_score", 0) + 0.5), 1
-            )
-            theme["goal_aligned"] = True
-        else:
-            theme["goal_aligned"] = False
-
+    ranked = rank_themes(theme_clusters, product_goal)
     ranked.sort(key=lambda t: t["opportunity_score"], reverse=True)
     return ranked
 
