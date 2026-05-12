@@ -62,18 +62,32 @@ with st.sidebar:
         anthropic_key = st.text_input(
             "Anthropic API key",
             type="password",
+            # Pre-fill from secrets if available — value is never displayed in plain text
             value=st.secrets.get("ANTHROPIC_API_KEY", ""),
         )
-        # Make the key available to pipeline._llm_call() via the environment
+        # Write to env only — key is never echoed to logs or UI elements
         if anthropic_key:
             os.environ["ANTHROPIC_API_KEY"] = anthropic_key
     else:
         anthropic_key = ""
 
     st.divider()
-    st.caption(
-        "⚠️ **Governance notice:** Outputs are AI-generated drafts and require "
-        "human review before roadmap decisions or Trello card creation."
+
+    # ── Governance notice (persistent, always visible) ────────────────────────
+    st.warning(
+        "**AI-generated drafts only.**\n\n"
+        "All outputs require human review before being used as the basis "
+        "for roadmap decisions, stakeholder communications, or Trello card creation."
+    )
+
+    st.divider()
+
+    # ── Data privacy notice ───────────────────────────────────────────────────
+    st.info(
+        "**Data privacy reminder**\n\n"
+        "Use only **synthetic or publicly available** data with this tool. "
+        "Do not upload private customer data, personally identifiable information (PII), "
+        "or confidential company data."
     )
 
 # ── Session state defaults ────────────────────────────────────────────────────
@@ -126,6 +140,14 @@ st.markdown(
     "This app turns raw electricity customer survey reviews into prioritized product "
     "backlog cards using a multi-step GenAI workflow."
 )
+
+st.warning(
+    "⚠️ **All outputs are AI-generated draft insights.** "
+    "They should not be the sole basis for roadmap decisions, stakeholder commitments, "
+    "or product actions. A product manager must review and validate every output "
+    "before acting on it."
+)
+
 st.divider()
 
 # ── Data loading ──────────────────────────────────────────────────────────────
@@ -169,14 +191,66 @@ if st.session_state.df_raw is not None:
 
     st.subheader("Data Preview")
 
+    dup_count_preview = _quick_duplicate_count(df)
+    cols_present      = sum(c in df.columns for c in REQUIRED_COLUMNS)
+    missing_cols      = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Total rows", f"{len(df):,}")
     m2.metric("Columns", len(df.columns))
     m3.metric(
         "Required columns present",
-        f"{sum(c in df.columns for c in REQUIRED_COLUMNS)}/{len(REQUIRED_COLUMNS)}",
+        f"{cols_present}/{len(REQUIRED_COLUMNS)}",
+        delta=None if cols_present == len(REQUIRED_COLUMNS) else f"−{len(missing_cols)} missing",
+        delta_color="off" if cols_present == len(REQUIRED_COLUMNS) else "inverse",
     )
-    m4.metric("Exact duplicates", _quick_duplicate_count(df))
+    m4.metric("Exact duplicates", dup_count_preview)
+
+    # ── Pre-analysis data quality warnings ────────────────────────────────────
+
+    if missing_cols:
+        st.error(
+            f"**Missing required columns:** {', '.join(f'`{c}`' for c in missing_cols)}. "
+            "The pipeline cannot run until these columns are present. "
+            "See `data/README.md` for the expected schema."
+        )
+
+    if len(df) < 10:
+        st.warning(
+            f"⚠️ Only **{len(df)} rows** detected. "
+            "Theme clustering works best with 10 or more unique responses. "
+            "Results from small datasets may not be representative."
+        )
+
+    if "written_explanation" in df.columns:
+        blank_pct = (
+            df["written_explanation"]
+            .astype(str)
+            .str.strip()
+            .eq("")
+            .mean()
+        )
+        if blank_pct > 0.3:
+            st.warning(
+                f"⚠️ **{blank_pct:.0%} of written explanations are blank.** "
+                "Rows with no text will be removed before analysis. "
+                "A high blank rate may result in themes with limited evidence."
+            )
+
+    if dup_count_preview > 0:
+        dup_pct = dup_count_preview / len(df)
+        level   = "error" if dup_pct > 0.3 else "warning"
+        msg     = (
+            f"⚠️ **{dup_count_preview} exact duplicate responses detected** "
+            f"({dup_pct:.0%} of rows). "
+            "Duplicates will be excluded before analysis. "
+        )
+        if dup_pct > 0.3:
+            msg += (
+                "A duplication rate above 30% may indicate a data collection issue — "
+                "review your source data before running the pipeline."
+            )
+        getattr(st, level)(msg)
 
     with st.expander("First 10 rows", expanded=True):
         st.dataframe(df.head(10), use_container_width=True)
@@ -239,9 +313,31 @@ if st.session_state.df_raw is not None:
         df_deduped = dup_result["deduped_df"]
         dup_summary = dup_result["duplicate_summary"]
 
+        # Warn when a large proportion of responses were duplicates
+        dup_pct = dup_result["duplicate_count"] / max(len(df_clean), 1)
+        if dup_pct > 0.2:
+            st.warning(
+                f"⚠️ **{dup_result['duplicate_count']} duplicate responses removed** "
+                f"({dup_pct:.0%} of cleaned data). "
+                "Insights are based on the remaining unique responses only."
+            )
+
+        # Warn when usable dataset is very small after deduplication
+        if len(df_deduped) < 10:
+            st.warning(
+                f"⚠️ Only **{len(df_deduped)} usable responses** remain after "
+                "cleaning and deduplication. Results may not be representative. "
+                "Consider uploading a larger dataset before making decisions."
+            )
+
+        # Collect pipeline-level warnings (auto-mock fallbacks, batch failures)
+        pipeline_warnings: list[str] = []
+
         # Step 4 — Classify (returns list[dict], not a DataFrame)
         advance(3)
-        classified = pipeline.classify_reviews(df_deduped, product_goal, use_mock=mock_mode)
+        classified = pipeline.classify_reviews(
+            df_deduped, product_goal, use_mock=mock_mode, warnings=pipeline_warnings
+        )
         st.session_state.classified_reviews = classified
 
         # Step 5 — Cluster (takes list[dict])
@@ -257,7 +353,8 @@ if st.session_state.df_raw is not None:
         # Step 7 — Brief (now requires dup_summary)
         advance(6)
         brief = pipeline.generate_insights_brief(
-            scored, dup_summary, product_goal, use_mock=mock_mode
+            scored, dup_summary, product_goal,
+            use_mock=mock_mode, warnings=pipeline_warnings,
         )
         st.session_state.brief = brief
 
@@ -269,6 +366,10 @@ if st.session_state.df_raw is not None:
 
         prog.progress(1.0, text="✅ Analysis complete!")
         st.session_state.pipeline_done = True
+
+        # Surface any non-fatal pipeline warnings (e.g. auto-mock fallback)
+        for pw in pipeline_warnings:
+            st.warning(f"⚠️ {pw}")
 
 # ── Results tabs ──────────────────────────────────────────────────────────────
 
@@ -295,6 +396,7 @@ if st.session_state.pipeline_done:
     # ── Overview ──────────────────────────────────────────────────────────────
 
     with tab_overview:
+        st.caption("🤖 *AI-generated draft insights — review all outputs before acting on them.*")
         st.subheader("Pipeline Summary")
         val        = st.session_state.validation or {}
         dup_result = st.session_state.dup_result or {}
@@ -308,7 +410,10 @@ if st.session_state.pipeline_done:
 
         st.divider()
         st.subheader("Classified Reviews")
-        st.caption("One row per survey response after deduplication and classification.")
+        st.caption(
+            "One row per survey response after deduplication and classification. "
+            "Classifications are AI-generated — verify individual rows before using as evidence."
+        )
 
         # classified_reviews is a list[dict] — convert to DataFrame for display
         clf_df = pd.DataFrame(st.session_state.classified_reviews or [])
@@ -323,7 +428,10 @@ if st.session_state.pipeline_done:
 
     with tab_clusters:
         st.subheader("Theme Clusters")
-        st.caption("Each theme groups reviews with a common underlying issue or opportunity.")
+        st.caption(
+            "Each theme groups reviews with a common underlying issue or opportunity. "
+            "🤖 *Theme names and groupings are AI-generated — verify before presenting externally.*"
+        )
 
         for i, t in enumerate(st.session_state.themes or [], 1):
             # Count sentiment breakdown from the theme's reviews
@@ -332,15 +440,32 @@ if st.session_state.pipeline_done:
                 s = r.get("sentiment", "unknown")
                 sentiment_counts[s] = sentiment_counts.get(s, 0) + 1
 
-            label = f"{i}. {t['name']} — {t['review_count']} reviews"
+            conf        = t.get("confidence_level", "medium")
+            review_cnt  = t.get("review_count", 0)
+            needs_review = conf == "low" or review_cnt < 3
+
+            label = f"{i}. {t['name']} — {review_cnt} reviews"
             with st.expander(label, expanded=(i <= 3)):
+
+                if needs_review:
+                    reasons = []
+                    if conf == "low":
+                        reasons.append("low model confidence")
+                    if review_cnt < 3:
+                        reasons.append(f"only {review_cnt} supporting review(s)")
+                    st.warning(
+                        f"⚠️ **Needs Human Validation** — {', '.join(reasons)}. "
+                        "Treat this theme as a weak signal until more evidence is available."
+                    )
+
                 st.markdown(f"**Key pain point:** {t.get('key_pain_point', '—')}")
 
-                c1, c2, c3, c4 = st.columns(4)
+                c1, c2, c3, c4, c5 = st.columns(5)
                 c1.metric("Issue Category",    t.get("issue_category", "—").replace("_", " ").title())
                 c2.metric("Dominant Severity", t.get("dominant_severity", "—").title())
                 c3.metric("Avg NPS Score",     t.get("avg_nps_score", "—"))
                 c4.metric("Detractors",        t.get("detractor_count", 0))
+                c5.metric("Confidence",        conf.title())
 
                 if sentiment_counts:
                     st.markdown(
@@ -358,10 +483,6 @@ if st.session_state.pipeline_done:
                 if plans:
                     st.markdown("**Affected plans:** " + ", ".join(f"`{p}`" for p in plans))
 
-                st.markdown(
-                    f"**Confidence:** `{t.get('confidence_level', '—')}`"
-                )
-
     # ── Prioritized Opportunities ─────────────────────────────────────────────
 
     with tab_opps:
@@ -373,18 +494,20 @@ if st.session_state.pipeline_done:
 
         opp_rows = [
             {
-                "Priority":     t.get("priority", "?"),
-                "Theme":        t["name"],
-                "Reviews":      t["review_count"],
-                "Avg NPS":      t.get("avg_nps_score", "—"),
-                "Severity":     t.get("dominant_severity", "").title(),
-                "Score":        t.get("opportunity_score", 0),
-                "Frequency":    t.get("frequency_score", 0),
-                "Severity Sc.": t.get("severity_score", 0),
-                "Biz Impact":   t.get("business_impact_score", 0),
-                "Confidence":   t.get("confidence_score", 0),
-                "NPS Risk":     t.get("nps_risk_score", 0),
-                "Goal Aligned": "✅" if t.get("goal_aligned") else "—",
+                "Priority":        t.get("priority", "?"),
+                "Theme":           t["name"],
+                "Reviews":         t["review_count"],
+                "Avg NPS":         t.get("avg_nps_score", "—"),
+                "Severity":        t.get("dominant_severity", "").title(),
+                "Score":           t.get("opportunity_score", 0),
+                "Confidence":      t.get("confidence_level", "—").title(),
+                "Frequency":       t.get("frequency_score", 0),
+                "Severity Sc.":    t.get("severity_score", 0),
+                "Biz Impact":      t.get("business_impact_score", 0),
+                "Conf. Score":     t.get("confidence_score", 0),
+                "NPS Risk":        t.get("nps_risk_score", 0),
+                "Goal Aligned":    "✅" if t.get("goal_aligned") else "—",
+                "Needs Review":    "⚠️ Yes" if t.get("confidence_level") == "low" or t.get("review_count", 0) < 3 else "—",
             }
             for t in (st.session_state.scored_themes or [])
         ]
@@ -398,6 +521,10 @@ if st.session_state.pipeline_done:
     with tab_brief:
         st.subheader("Product Insights Brief")
         st.caption(f"Goal: {product_goal}")
+        st.warning(
+            "🤖 **AI-generated draft.** This brief was produced by an automated pipeline. "
+            "Verify key claims against the classified reviews before sharing with stakeholders."
+        )
         st.markdown(st.session_state.brief)
 
     # ── Trello Cards ──────────────────────────────────────────────────────────
@@ -500,7 +627,10 @@ if st.session_state.pipeline_done:
             st.markdown("**In the meantime, export your approved cards as CSV:**")
 
             if n_approved == 0:
-                st.caption("Approve at least one card above to enable export.")
+                st.warning(
+                    "⚠️ No cards approved. "
+                    "Check **Approve** on at least one card above to enable CSV export."
+                )
             else:
                 approved_cards = [cards[i] for i in sorted(st.session_state.approved)]
                 export_rows = [
@@ -584,7 +714,12 @@ if st.session_state.pipeline_done:
                 )
 
             if n_approved == 0:
-                st.caption("Approve at least one card above to enable sending.")
+                st.warning(
+                    "⚠️ No cards approved. "
+                    "Check **Approve** on at least one card above to enable sending to Trello."
+                )
+            elif not list_id:
+                pass  # already warned above via the list_id check
 
             send_disabled = n_approved == 0 or not list_id
             if st.button(
