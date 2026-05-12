@@ -1,13 +1,14 @@
 """
 app.py
-Review2Roadmap — Agentic Product Feedback Triage Tool
-JHU Carey Generative AI Final Project (Spring 2026)
+Review2Roadmap: Agentic Customer Feedback Triage
+JHU Carey Generative AI Final Project — Spring 2026
 
 Run with:  streamlit run app.py
 """
 
-import streamlit as st
+import os
 import pandas as pd
+import streamlit as st
 
 import agent_pipeline as pipeline
 import evaluation as ev
@@ -21,57 +22,57 @@ st.set_page_config(
     layout="wide",
 )
 
-# ── Sidebar: configuration ────────────────────────────────────────────────────
+SAMPLE_DATA_PATH = os.path.join("data", "fake_electricity_customer_reviews_500.csv")
+REQUIRED_COLUMNS = {"review_id", "review_text", "rating"}
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.title("⚙️ Configuration")
+    st.title("⚙️ Settings")
 
-    st.subheader("Anthropic API")
-    anthropic_key = st.text_input(
-        "API Key",
-        type="password",
-        value=st.secrets.get("ANTHROPIC_API_KEY", ""),
-        help="Leave blank to run in mock mode — no key needed for demo.",
-    )
-    mock_mode = not bool(anthropic_key)
-
-    if mock_mode:
-        st.info("🔄 Mock mode — keyword heuristics replace LLM calls.")
-    else:
-        st.success("✅ Live mode — using Claude via Anthropic API.")
-
-    st.divider()
-    st.subheader("Product Goal")
     product_goal = st.selectbox(
-        "Select your focus area",
+        "Product goal",
         [
-            "Improve digital self-service",
-            "Reduce billing disputes",
-            "Improve outage communication",
-            "Increase mobile app adoption",
-            "Reduce call center volume",
+            "Reduce churn",
+            "Improve customer satisfaction",
+            "Reduce support tickets",
+            "Identify urgent bugs or service failures",
+            "Find quick wins for the product roadmap",
         ],
     )
 
-    st.divider()
-    st.subheader("Trello (optional)")
-    trello_key   = st.text_input("API Key",  type="password", key="tk", value=st.secrets.get("TRELLO_API_KEY", ""))
-    trello_token = st.text_input("Token",    type="password", key="tt", value=st.secrets.get("TRELLO_TOKEN", ""))
-    trello_board = st.text_input("Board ID", key="tb",                  value=st.secrets.get("TRELLO_BOARD_ID", ""))
-    trello_list  = st.text_input("List ID (Backlog)", key="tl",         value=st.secrets.get("TRELLO_LIST_ID", ""))
-    trello_configured = trello_ready(trello_key, trello_token, trello_board, trello_list)
+    max_cards = st.number_input(
+        "Maximum backlog cards to generate",
+        min_value=1,
+        max_value=10,
+        value=5,
+        step=1,
+    )
 
-    if trello_configured:
-        st.success("✅ Trello connected.")
+    mock_mode = st.checkbox("Use mock mode instead of live LLM", value=True)
+
+    if not mock_mode:
+        anthropic_key = st.text_input(
+            "Anthropic API key",
+            type="password",
+            value=st.secrets.get("ANTHROPIC_API_KEY", ""),
+        )
     else:
-        st.caption("Fill all four fields to enable Trello export.")
+        anthropic_key = ""
+
+    st.divider()
+    st.caption(
+        "⚠️ **Governance notice:** Outputs are AI-generated drafts and require "
+        "human review before roadmap decisions or Trello card creation."
+    )
 
 # ── Session state defaults ────────────────────────────────────────────────────
 
-_STATE_KEYS = ["df_raw", "df_clean", "df_classified", "themes",
-               "scored_themes", "brief", "cards", "pipeline_done",
-               "baseline_out", "dup_pairs", "validation"]
-
+_STATE_KEYS = [
+    "df_raw", "df_clean", "df_classified", "themes",
+    "scored_themes", "brief", "cards", "pipeline_done",
+    "baseline_out", "dup_pairs", "validation",
+]
 for k in _STATE_KEYS:
     if k not in st.session_state:
         st.session_state[k] = None
@@ -79,201 +80,305 @@ for k in _STATE_KEYS:
 if "approved" not in st.session_state:
     st.session_state.approved = set()
 
-# ── Tabs ──────────────────────────────────────────────────────────────────────
 
-tab_workflow, tab_eval, tab_about = st.tabs(["🔄 Workflow", "📊 Evaluation", "ℹ️ About"])
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 1 — WORKFLOW
-# ══════════════════════════════════════════════════════════════════════════════
+def _reset_pipeline_state():
+    for k in ["df_clean", "df_classified", "themes", "scored_themes",
+              "brief", "cards", "pipeline_done", "dup_pairs", "validation"]:
+        st.session_state[k] = None
+    st.session_state.approved = set()
 
-with tab_workflow:
-    st.title("🗺️ Review2Roadmap")
-    st.caption(
-        "Upload electricity customer survey data → get a prioritized product backlog. "
-        "Every step is shown so you can see how the agentic pipeline works."
-    )
 
-    # ── Step 1: Load data ──────────────────────────────────────────────────────
+def _quick_duplicate_count(df: pd.DataFrame) -> int:
+    """Count exact duplicate review_text values as a fast preview heuristic."""
+    if "review_text" not in df.columns:
+        return 0
+    return int(df["review_text"].duplicated().sum())
 
-    st.header("Step 1 · Load Data")
-    col_upload, col_sample = st.columns([3, 1])
 
-    with col_upload:
-        uploaded = st.file_uploader("Upload a survey CSV", type=["csv"])
+def _column_status(df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for col in sorted(REQUIRED_COLUMNS):
+        present = col in df.columns
+        rows.append({
+            "Column": col,
+            "Required": "✅ Yes",
+            "Present": "✅ Found" if present else "❌ Missing",
+        })
+    return pd.DataFrame(rows)
 
-    with col_sample:
-        st.write("")  # vertical spacing
-        st.write("")
-        if st.button("📂 Load Sample Dataset"):
+
+# ── Header ────────────────────────────────────────────────────────────────────
+
+st.title("🗺️ Review2Roadmap: Agentic Customer Feedback Triage")
+st.markdown(
+    "This app turns raw electricity customer survey reviews into prioritized product "
+    "backlog cards using a multi-step GenAI workflow."
+)
+st.divider()
+
+# ── Data loading ──────────────────────────────────────────────────────────────
+
+col_upload, col_sample = st.columns([3, 1])
+
+with col_upload:
+    uploaded = st.file_uploader("Upload a survey CSV", type=["csv"])
+
+with col_sample:
+    st.write("")
+    st.write("")
+    if st.button("📂 Load Sample Dataset"):
+        if os.path.exists(SAMPLE_DATA_PATH):
+            try:
+                st.session_state.df_raw = pd.read_csv(SAMPLE_DATA_PATH)
+                _reset_pipeline_state()
+                st.success(f"Loaded {len(st.session_state.df_raw):,} rows from sample dataset.")
+            except Exception as exc:
+                st.error(f"Could not read sample file: {exc}")
+        else:
             st.session_state.df_raw = pipeline.generate_sample_data()
-            # Reset downstream state when new data is loaded
-            for k in ["df_clean", "df_classified", "themes", "scored_themes",
-                      "brief", "cards", "pipeline_done", "approved"]:
-                st.session_state[k] = None
-            st.session_state.approved = set()
-            st.success("30 synthetic electricity reviews loaded.")
+            _reset_pipeline_state()
+            st.info(
+                "Sample file not found at `data/fake_electricity_customer_reviews_500.csv`. "
+                "Loaded 30-row built-in dataset instead."
+            )
 
-    if uploaded is not None:
-        try:
-            st.session_state.df_raw = pd.read_csv(uploaded)
-            for k in ["df_clean", "df_classified", "themes", "scored_themes",
-                      "brief", "cards", "pipeline_done"]:
-                st.session_state[k] = None
-            st.session_state.approved = set()
-            st.success(f"Uploaded {len(st.session_state.df_raw):,} rows.")
-        except Exception as exc:
-            st.error(f"Could not read CSV: {exc}")
+if uploaded is not None:
+    try:
+        st.session_state.df_raw = pd.read_csv(uploaded)
+        _reset_pipeline_state()
+        st.success(f"Uploaded {len(st.session_state.df_raw):,} rows.")
+    except Exception as exc:
+        st.error(f"Could not read CSV: {exc}")
 
-    if st.session_state.df_raw is not None:
-        with st.expander("Preview raw data", expanded=False):
-            st.dataframe(st.session_state.df_raw.head(10), use_container_width=True)
+# ── Data preview ──────────────────────────────────────────────────────────────
+
+if st.session_state.df_raw is not None:
+    df = st.session_state.df_raw
+
+    st.subheader("Data Preview")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total rows", f"{len(df):,}")
+    m2.metric("Columns", len(df.columns))
+    m3.metric("Required columns present",
+              f"{sum(c in df.columns for c in REQUIRED_COLUMNS)}/{len(REQUIRED_COLUMNS)}")
+    m4.metric("Exact duplicates", _quick_duplicate_count(df))
+
+    with st.expander("First 10 rows", expanded=True):
+        st.dataframe(df.head(10), use_container_width=True)
+
+    col_left, col_right = st.columns(2)
+    with col_left:
+        st.markdown("**Column names**")
+        st.code(", ".join(df.columns.tolist()))
+    with col_right:
+        st.markdown("**Required column status**")
+        st.dataframe(_column_status(df), use_container_width=True, hide_index=True)
 
     st.divider()
 
-    # ── Run pipeline ───────────────────────────────────────────────────────────
+# ── Run Agent Analysis ────────────────────────────────────────────────────────
 
     run_disabled = st.session_state.df_raw is None
-    if st.button("🚀 Run Pipeline", type="primary", disabled=run_disabled):
+
+    if st.button("▶ Run Agent Analysis", type="primary", disabled=run_disabled):
         client = pipeline.get_client(None if mock_mode else anthropic_key)
-        prog = st.progress(0, text="Starting…")
+        prog = st.progress(0)
         status = st.empty()
 
-        # 1 — Validate
-        status.markdown("**Step 1/8 — Validating CSV…**")
-        val = pipeline.validate_csv(st.session_state.df_raw)
+        steps = [
+            "Validating CSV",
+            "Cleaning reviews",
+            "Detecting duplicates",
+            "Classifying reviews",
+            "Clustering themes",
+            "Scoring product opportunities",
+            "Generating product insights brief",
+            "Creating backlog cards",
+        ]
+        total = len(steps)
+
+        def advance(i):
+            prog.progress((i + 1) / total, text=f"Step {i + 1}/{total} — {steps[i]}")
+
+        # Step 1 — Validate
+        advance(0)
+        val = pipeline.validate_csv(df)
         st.session_state.validation = val
-        prog.progress(10)
-
         if not val["valid"]:
-            status.empty()
-            st.error("Validation failed: " + " | ".join(val["errors"]))
+            prog.empty()
+            status.error("Validation failed: " + " | ".join(val["errors"]))
             st.stop()
+        for w in val.get("warnings", []):
+            st.warning(w)
 
-        if val["warnings"]:
-            for w in val["warnings"]:
-                st.warning(w)
-
-        # 2 — Clean
-        status.markdown("**Step 2/8 — Cleaning reviews…**")
-        df_clean, clean_stats = pipeline.clean_reviews(st.session_state.df_raw)
+        # Step 2 — Clean
+        advance(1)
+        df_clean, _ = pipeline.clean_reviews(df)
         st.session_state.df_clean = df_clean
-        prog.progress(22)
 
-        # 3 — Deduplicate
-        status.markdown("**Step 3/8 — Detecting duplicate responses…**")
+        # Step 3 — Deduplicate
+        advance(2)
         df_deduped, dup_pairs = pipeline.detect_duplicates(df_clean)
         st.session_state.dup_pairs = dup_pairs
-        prog.progress(34)
 
-        # 4 — Classify
-        status.markdown("**Step 4/8 — Classifying reviews…**")
+        # Step 4 — Classify
+        advance(3)
         df_classified = pipeline.classify_reviews(df_deduped, client=client, mock=mock_mode)
         st.session_state.df_classified = df_classified
-        prog.progress(48)
 
-        # 5 — Cluster
-        status.markdown("**Step 5/8 — Clustering themes…**")
+        # Step 5 — Cluster
+        advance(4)
         themes = pipeline.cluster_themes(df_classified, client=client, mock=mock_mode)
         st.session_state.themes = themes
-        prog.progress(62)
 
-        # 6 — Score
-        status.markdown("**Step 6/8 — Scoring opportunities…**")
+        # Step 6 — Score
+        advance(5)
         scored = pipeline.score_opportunities(themes)
         st.session_state.scored_themes = scored
-        prog.progress(74)
 
-        # 7 — Brief
-        status.markdown("**Step 7/8 — Generating insights brief…**")
+        # Step 7 — Brief
+        advance(6)
         brief = pipeline.generate_brief(scored, product_goal, client=client, mock=mock_mode)
         st.session_state.brief = brief
-        prog.progress(88)
 
-        # 8 — Cards
-        status.markdown("**Step 8/8 — Generating backlog cards…**")
-        cards = pipeline.generate_backlog_cards(scored, product_goal, client=client, mock=mock_mode)
+        # Step 8 — Cards (capped by max_cards)
+        advance(7)
+        top_themes = scored[:max_cards]
+        cards = pipeline.generate_backlog_cards(top_themes, product_goal, client=client, mock=mock_mode)
         st.session_state.cards = cards
         st.session_state.approved = set()
-        prog.progress(100)
-        status.markdown("✅ **Pipeline complete!**")
+
+        prog.progress(1.0, text="✅ Analysis complete!")
         st.session_state.pipeline_done = True
 
-    # ── Results ────────────────────────────────────────────────────────────────
+# ── Results tabs ──────────────────────────────────────────────────────────────
 
-    if st.session_state.pipeline_done:
+if st.session_state.pipeline_done:
 
-        # Pipeline summary metrics
+    (
+        tab_overview,
+        tab_clusters,
+        tab_opps,
+        tab_brief,
+        tab_trello,
+        tab_baseline,
+        tab_eval,
+    ) = st.tabs([
+        "Overview",
+        "Theme Clusters",
+        "Prioritized Opportunities",
+        "Product Insights Brief",
+        "Trello Cards",
+        "Baseline Comparison",
+        "Evaluation Preview",
+    ])
+
+    # ── Overview ──────────────────────────────────────────────────────────────
+
+    with tab_overview:
+        st.subheader("Pipeline Summary")
         val = st.session_state.validation or {}
         dup_count = len(st.session_state.dup_pairs or [])
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Reviews loaded",     val.get("row_count", "—"))
-        col2.metric("After cleaning",     len(st.session_state.df_clean))
-        col3.metric("Duplicates flagged", dup_count)
-        col4.metric("Themes found",       len(st.session_state.themes))
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Reviews loaded",     f"{val.get('row_count', '—'):,}" if val.get("row_count") else "—")
+        c2.metric("After cleaning",     len(st.session_state.df_clean))
+        c3.metric("Duplicates flagged", dup_count)
+        c4.metric("Themes found",       len(st.session_state.themes or []))
+        c5.metric("Cards generated",    len(st.session_state.cards or []))
 
         st.divider()
-
-        # Step 4 — Classified table
-        st.subheader("Step 4 · Classified Reviews")
-        show_cols = ["review_id", "review_text", "category", "sentiment", "severity", "opportunity_type"]
-        available = [c for c in show_cols if c in st.session_state.df_classified.columns]
+        st.subheader("Classified Reviews")
+        show = ["review_id", "review_text", "category", "sentiment", "severity", "opportunity_type"]
+        available = [c for c in show if c in st.session_state.df_classified.columns]
         st.dataframe(
             st.session_state.df_classified[available],
             use_container_width=True,
-            height=250,
+            height=300,
         )
 
-        st.divider()
+    # ── Theme Clusters ────────────────────────────────────────────────────────
 
-        # Step 6 — Scored opportunities
-        st.subheader("Step 6 · Scored Opportunities")
-        st.caption("Weighted score (1–10): frequency 25% · severity 30% · business impact 20% · confidence 15% · NPS risk 10%")
-        score_rows = [
+    with tab_clusters:
+        st.subheader("Theme Clusters")
+        st.caption("Each theme groups reviews with a common underlying issue or opportunity.")
+
+        for i, t in enumerate(st.session_state.themes or [], 1):
+            sentiment = {}
+            for r in t.get("reviews", []):
+                s = r.get("sentiment", "unknown")
+                sentiment[s] = sentiment.get(s, 0) + 1
+
+            with st.expander(f"{i}. {t['name']} — {t['review_count']} reviews", expanded=(i <= 3)):
+                st.markdown(f"**Description:** {t.get('description', '—')}")
+                st.markdown(f"**Key pain point:** {t.get('key_pain_point', '—')}")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Category",          t.get("category", "—").replace("_", " ").title())
+                c2.metric("Dominant Severity", t.get("dominant_severity", "—").title())
+                c3.metric("Review Count",      t.get("review_count", 0))
+                if sentiment:
+                    st.markdown(
+                        "**Sentiment split:** "
+                        + "  ·  ".join(f"{k}: {v}" for k, v in sentiment.items())
+                    )
+
+    # ── Prioritized Opportunities ─────────────────────────────────────────────
+
+    with tab_opps:
+        st.subheader("Prioritized Opportunities")
+        st.caption(
+            "Weighted opportunity score (1–10): "
+            "Frequency 25% · Severity 30% · Business Impact 20% · Confidence 15% · NPS Risk 10%"
+        )
+
+        rows = [
             {
-                "Priority": t.get("priority", "?"),
-                "Theme": t["name"],
-                "Reviews": t["review_count"],
-                "Severity": t.get("dominant_severity", ""),
-                "Score": t.get("opportunity_score", 0),
-                "Freq": t.get("frequency_score", 0),
-                "Sev": t.get("severity_score", 0),
-                "BizImpact": t.get("business_impact_score", 0),
+                "Priority":      t.get("priority", "?"),
+                "Theme":         t["name"],
+                "Reviews":       t["review_count"],
+                "Severity":      t.get("dominant_severity", "").title(),
+                "Score":         t.get("opportunity_score", 0),
+                "Frequency":     t.get("frequency_score", 0),
+                "Severity Sc.":  t.get("severity_score", 0),
+                "Biz Impact":    t.get("business_impact_score", 0),
+                "Confidence":    t.get("confidence_score", 0),
+                "NPS Risk":      t.get("nps_risk_score", 0),
             }
-            for t in st.session_state.scored_themes
+            for t in (st.session_state.scored_themes or [])
         ]
         st.dataframe(
-            pd.DataFrame(score_rows).sort_values("Score", ascending=False),
+            pd.DataFrame(rows).sort_values("Score", ascending=False),
             use_container_width=True,
         )
 
-        st.divider()
+    # ── Product Insights Brief ────────────────────────────────────────────────
 
-        # Step 7 — Insights brief
-        st.subheader("Step 7 · Product Insights Brief")
+    with tab_brief:
+        st.subheader("Product Insights Brief")
+        st.caption(f"Goal: {product_goal}")
         st.markdown(st.session_state.brief)
 
-        st.divider()
+    # ── Trello Cards ──────────────────────────────────────────────────────────
 
-        # Step 8–9 — Card approval
-        st.subheader("Step 8–9 · Review & Approve Backlog Cards")
+    with tab_trello:
+        st.subheader("Trello-Ready Backlog Cards")
         st.caption(
-            "Check the cards you want to send to Trello, then click **Send Approved Cards**. "
+            "Review each card below. Check **Approve** on the cards you want to send to Trello. "
             "This human review gate is a governance feature of the agentic workflow."
         )
 
         cards = st.session_state.cards or []
         for i, card in enumerate(cards):
-            approved_icon = "✅" if i in st.session_state.approved else "⬜"
+            icon = "✅" if i in st.session_state.approved else "⬜"
             priority = card.get("priority", "?")
-            with st.expander(
-                f"{approved_icon} [{priority}] {card['title']}",
-                expanded=(i < 2),
-            ):
+            with st.expander(f"{icon} [{priority}] {card['title']}", expanded=(i == 0)):
                 left, right = st.columns([5, 1])
                 with left:
-                    st.markdown(f"**User Story:** {card.get('user_story', '')}")
-                    st.markdown(f"**Description:** {card.get('description', '')}")
+                    st.markdown(f"**User Story:** {card.get('user_story', '—')}")
+                    st.markdown(f"**Description:** {card.get('description', '—')}")
                     criteria = card.get("acceptance_criteria", [])
                     if criteria:
                         st.markdown("**Acceptance Criteria:**")
@@ -287,43 +392,45 @@ with tab_workflow:
                         f"**Score:** {card.get('opportunity_score', '—')}"
                     )
                 with right:
-                    checked = st.checkbox(
-                        "Approve",
-                        key=f"approve_{i}",
-                        value=(i in st.session_state.approved),
-                    )
+                    checked = st.checkbox("Approve", key=f"approve_{i}",
+                                          value=(i in st.session_state.approved))
                     if checked:
                         st.session_state.approved.add(i)
                     else:
                         st.session_state.approved.discard(i)
 
         st.divider()
+        st.subheader("Send to Trello")
 
-        # Step 10 — Trello send
-        st.subheader("Step 10 · Send to Trello")
+        with st.expander("Trello credentials (optional)", expanded=False):
+            trello_key   = st.text_input("API Key",  type="password", key="tk",
+                                         value=st.secrets.get("TRELLO_API_KEY", ""))
+            trello_token = st.text_input("Token",    type="password", key="tt",
+                                         value=st.secrets.get("TRELLO_TOKEN", ""))
+            trello_board = st.text_input("Board ID", key="tb",
+                                         value=st.secrets.get("TRELLO_BOARD_ID", ""))
+            trello_list  = st.text_input("List ID (Backlog)", key="tl",
+                                         value=st.secrets.get("TRELLO_LIST_ID", ""))
+
+        trello_configured = trello_ready(
+            st.session_state.get("tk", ""),
+            st.session_state.get("tt", ""),
+            st.session_state.get("tb", ""),
+            st.session_state.get("tl", ""),
+        )
+
         n_approved = len(st.session_state.approved)
-
-        if not trello_configured:
-            st.info(
-                "Trello credentials are not configured. "
-                "Fill in all four Trello fields in the sidebar to enable this step. "
-                "Cards will be sent in mock mode for demonstration."
-            )
-
-        send_label = f"📤 Send {n_approved} Approved Card(s) to Trello"
         if n_approved == 0:
             st.caption("Approve at least one card above to enable sending.")
 
-        if st.button(send_label, disabled=(n_approved == 0)):
+        if st.button(f"📤 Send {n_approved} Approved Card(s) to Trello", disabled=(n_approved == 0)):
             approved_cards = [cards[i] for i in sorted(st.session_state.approved)]
             results = []
-
             if trello_configured:
                 trello = TrelloClient(trello_key, trello_token, trello_board)
                 for card in approved_cards:
                     results.append(trello.create_card(card, list_id=trello_list))
             else:
-                # Mock send
                 for card in approved_cards:
                     results.append(mock_create_card(card))
 
@@ -331,140 +438,74 @@ with tab_workflow:
             failures  = [r for r in results if not r.get("success")]
 
             if successes:
-                mock_note = " (mock)" if not trello_configured else ""
-                st.success(f"✅ {len(successes)} card(s) created in Trello{mock_note}!")
+                label = "" if trello_configured else " (mock — Trello not configured)"
+                st.success(f"✅ {len(successes)} card(s) sent{label}!")
                 for r in successes:
-                    if r.get("url") and "mock" not in r.get("url", ""):
-                        st.markdown(f"- [{r['url']}]({r['url']})")
+                    if r.get("url") and "mock" not in r["url"]:
+                        st.markdown(f"- {r['url']}")
             if failures:
                 st.error(f"❌ {len(failures)} card(s) failed.")
                 for r in failures:
                     st.caption(r.get("error", "Unknown error"))
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — EVALUATION
-# ══════════════════════════════════════════════════════════════════════════════
+    # ── Baseline Comparison ───────────────────────────────────────────────────
 
-with tab_eval:
-    st.title("📊 Evaluation: Agentic Pipeline vs. Baseline")
-    st.markdown(
-        "The **baseline** is a single LLM prompt that summarizes reviews and lists top issues — "
-        "similar to what a product manager might do manually in 10 minutes. "
-        "The **agentic pipeline** runs 8 structured steps with scoring, clustering, and human review. "
-        "Use the rubric below to score both outputs."
-    )
+    with tab_baseline:
+        st.subheader("Baseline vs. Agentic Pipeline")
+        st.markdown(
+            "The **baseline** is a single LLM prompt that summarizes reviews and lists top issues — "
+            "the starting point the agentic pipeline improves on."
+        )
 
-    col_base, col_agent = st.columns(2)
+        col_b, col_a = st.columns(2)
 
-    with col_base:
-        st.subheader("Baseline Output")
-        st.caption("Single prompt → summary + issue list")
-        if st.button("Run Baseline"):
-            df = st.session_state.df_raw if st.session_state.df_raw is not None else pipeline.generate_sample_data()
-            client = pipeline.get_client(None if mock_mode else anthropic_key)
-            st.session_state.baseline_out = pipeline.run_baseline(df, product_goal, client=client, mock=mock_mode)
-        if st.session_state.baseline_out:
-            st.markdown(st.session_state.baseline_out)
-        else:
-            st.info("Click **Run Baseline** to generate the comparison output.")
+        with col_b:
+            st.markdown("#### Baseline")
+            st.caption("One prompt → summary + bullet list")
+            if st.button("Run Baseline"):
+                df_for_baseline = (
+                    st.session_state.df_raw
+                    if st.session_state.df_raw is not None
+                    else pipeline.generate_sample_data()
+                )
+                client = pipeline.get_client(None if mock_mode else anthropic_key)
+                st.session_state.baseline_out = pipeline.run_baseline(
+                    df_for_baseline, product_goal, client=client, mock=mock_mode
+                )
+            if st.session_state.baseline_out:
+                st.markdown(st.session_state.baseline_out)
+            else:
+                st.info("Click **Run Baseline** to generate the comparison output.")
 
-    with col_agent:
-        st.subheader("Agentic Pipeline Output")
-        st.caption("8-step orchestrated pipeline → scored themes + backlog cards")
-        if st.session_state.brief:
-            st.markdown(st.session_state.brief)
-            n_cards = len(st.session_state.cards or [])
-            st.caption(f"Plus {n_cards} backlog card(s) — see the Workflow tab.")
-        else:
-            st.info("Run the pipeline first on the **Workflow** tab.")
+        with col_a:
+            st.markdown("#### Agentic Pipeline")
+            st.caption("8 steps → classified themes, scores, brief, cards")
+            if st.session_state.brief:
+                st.markdown(st.session_state.brief)
+                st.caption(f"{len(st.session_state.cards or [])} backlog cards generated — see Trello Cards tab.")
+            else:
+                st.info("Run the agent analysis first.")
 
-    st.divider()
+    # ── Evaluation Preview ────────────────────────────────────────────────────
 
-    # Rubric
-    st.subheader("Evaluation Rubric")
-    st.caption(
-        "Score each output 1–5 on every dimension. "
-        "A score of 5 = fully meets the criterion; 1 = does not meet it at all."
-    )
-    st.dataframe(pd.DataFrame(ev.RUBRIC), use_container_width=True, height=280)
+    with tab_eval:
+        st.subheader("Evaluation Preview")
 
-    st.divider()
+        st.markdown("#### Evaluation Rubric")
+        st.caption("Score each output 1–5 on every dimension.")
+        st.dataframe(pd.DataFrame(ev.RUBRIC), use_container_width=True, height=270)
 
-    # Test set
-    st.subheader("Classification Test Set")
-    st.caption(
-        "10 held-out reviews with human-assigned ground-truth labels. "
-        "In live mode, run the classifier on these reviews and compare against ground truth."
-    )
-    test_df = pd.DataFrame(ev.TEST_SET)
-    st.dataframe(test_df, use_container_width=True, height=300)
+        st.divider()
 
-    st.divider()
+        st.markdown("#### Classification Test Set")
+        st.caption(
+            "10 held-out synthetic reviews with human-assigned ground-truth labels. "
+            "In live mode, run the classifier on these to measure accuracy."
+        )
+        st.dataframe(pd.DataFrame(ev.TEST_SET), use_container_width=True, height=300)
 
-    # Blank scorecard for human evaluators
-    st.subheader("Your Scorecard")
-    st.caption("Fill this in after reviewing both outputs above.")
-    scorecard_df = pd.DataFrame(ev.blank_rubric_scorecard())
-    st.dataframe(scorecard_df, use_container_width=True)
+        st.divider()
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — ABOUT
-# ══════════════════════════════════════════════════════════════════════════════
-
-with tab_about:
-    st.title("ℹ️ About Review2Roadmap")
-    st.markdown("""
-**Review2Roadmap** is a final project for the JHU Carey Generative AI course (Spring 2026).
-
----
-
-### What it does
-Transforms raw electricity customer survey reviews into prioritized, Trello-ready product
-backlog cards using a multi-step agentic pipeline powered by Claude.
-
----
-
-### Design choices (one user, one workflow, one deliverable)
-
-| Dimension | Choice |
-|-----------|--------|
-| **User** | Product manager / product experience analyst |
-| **Workflow** | Raw feedback CSV → prioritized backlog cards |
-| **Deliverable** | Insights brief + approved backlog cards |
-| **Baseline** | Single LLM prompt: summarize + list issues |
-
----
-
-### Course concepts demonstrated
-
-| Concept | Where it appears |
-|---------|-----------------|
-| Multi-step orchestration | 8-step pipeline in `agent_pipeline.py` |
-| Tool / function-style steps | Each step is a pure function with defined inputs/outputs |
-| Structured outputs | JSON classification schema, card schema |
-| Human-in-the-loop | Card approval gate before any Trello write (Step 9) |
-| Evaluation design | Rubric + 10-review test set in `evaluation.py` |
-| Governance | Validation, deduplication, and review gate before external action |
-
----
-
-### Repository layout
-
-```
-app.py              — Streamlit UI
-agent_pipeline.py   — 8-step pipeline (validate → cards)
-prompts.py          — All LLM prompts
-scoring.py          — Opportunity scoring formula
-trello_client.py    — Trello REST API wrapper
-evaluation.py       — Test set + evaluation rubric
-data/               — Place your CSV here (no PII)
-outputs/            — Downloaded reports land here
-.streamlit/         — secrets.toml.example for credentials
-```
-
----
-
-### Data & privacy
-All data in this project is **synthetic**. No real customer PII is used or committed.
-API keys are loaded from `.streamlit/secrets.toml` (git-ignored).
-    """)
+        st.markdown("#### Your Scorecard")
+        st.caption("Fill this in after reviewing both outputs in the Baseline Comparison tab.")
+        st.dataframe(pd.DataFrame(ev.blank_rubric_scorecard()), use_container_width=True)
