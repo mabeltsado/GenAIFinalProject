@@ -1645,10 +1645,10 @@ def run_agent_pipeline(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Baseline — single-prompt comparison (used in the Evaluation tab)
+# Baseline — single-prompt comparison
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_baseline(
+def run_baseline_summary(
     df: pd.DataFrame,
     product_goal: str,
     use_mock: bool = False,
@@ -1656,22 +1656,33 @@ def run_baseline(
     """
     Single-prompt baseline for comparison against the agentic pipeline.
 
-    This represents the simplest possible approach: send all reviews to an LLM
-    in one prompt and ask for a summary. No classification, clustering, or
-    scoring. Used in the Evaluation tab to show concretely what the 8-step
-    pipeline adds over a basic prompt.
+    The prompt is deliberately simple: "Summarize these customer reviews and
+    list the top issues." — no classification schema, no clustering, no scoring.
+    This is the starting point the 8-step pipeline improves on, and is used in
+    the Baseline Comparison tab to make that improvement concrete and visible.
+
+    In live mode the function checks for an API key the same way the rest of
+    the pipeline does (st.secrets → env var). If no key is found it falls back
+    to the mock path automatically.
 
     Parameters
     ----------
-    df : pd.DataFrame   — any survey DataFrame with a written_explanation column
-    product_goal : str  — included in the prompt for context
-    use_mock : bool     — True returns a static mock response
+    df : pd.DataFrame
+        Any survey DataFrame with written_explanation and
+        recommendation_score_0_to_10 columns.
+    product_goal : str
+        The PM's selected product goal — passed for context but not used to
+        structure the output (that's the point: the baseline ignores it).
+    use_mock : bool
+        If True, use the rule-based summary. If False, call the API.
 
     Returns
     -------
-    str  — plain text or markdown summary.
+    str
+        Markdown-formatted summary. Always includes a footer noting this is
+        the baseline output for comparison purposes.
     """
-    if not use_mock:
+    if not use_mock and _get_api_key():
         try:
             reviews_text = "\n".join(
                 f"[NPS {row.get('recommendation_score_0_to_10', '?')}/10] "
@@ -1679,25 +1690,66 @@ def run_baseline(
                 for _, row in df.iterrows()
             )
             prompt = BASELINE_PROMPT.format(reviews_text=reviews_text)
-            return _llm_call(prompt, max_tokens=600)
+            result = _llm_call(prompt, max_tokens=700)
+            return result + (
+                "\n\n---\n"
+                "*This is the baseline output — one prompt, no classification, "
+                "no clustering, no scoring.*"
+            )
         except Exception:
             pass  # fall through to mock
 
+    # ── Mock: derive the summary from the actual uploaded data ────────────────
+    # Count issues by keyword category so the mock reflects the real dataset.
+    category_counts: dict[str, int] = {}
+    for _, row in df.iterrows():
+        text = str(row.get("written_explanation", "")).lower()
+        for opp, keywords in _KEYWORD_MAP.items():
+            if any(kw in text for kw in keywords):
+                category_counts[opp] = category_counts.get(opp, 0) + 1
+                break
+
+    total = len(df)
+    top_issues = sorted(category_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+
+    # Build a plain-language summary sentence from the top two categories
+    if top_issues:
+        top_name   = top_issues[0][0].replace("_", " ")
+        top_count  = top_issues[0][1]
+        second     = f" and {top_issues[1][0].replace('_', ' ')}" if len(top_issues) > 1 else ""
+        summary_sentence = (
+            f"Analysis of {total} survey responses shows that **{top_name}**{second} "
+            f"are the most frequently raised issues. "
+            f"{top_count} of {total} responses mention {top_name}-related concerns."
+        )
+    else:
+        summary_sentence = f"Analysis of {total} survey responses — no clear dominant issue identified."
+
+    issue_lines = "\n".join(
+        f"- **{name.replace('_', ' ').title()}** — {count} mention{'s' if count != 1 else ''}"
+        for name, count in top_issues
+    )
+
+    detractor_count = int(
+        df["recommendation_score_0_to_10"]
+        .apply(lambda s: pd.to_numeric(s, errors="coerce"))
+        .lt(7)
+        .sum()
+    ) if "recommendation_score_0_to_10" in df.columns else "?"
+
     return (
-        "**Summary:** Customers are primarily frustrated by unexpected billing changes, "
-        "lack of communication during power outages, and a mobile app that frequently fails. "
-        "Positive feedback centres on time-of-use pricing benefits and individual service interactions.\n\n"
-        "**Top 5 Issues:**\n"
-        "- Unexplained or unexpected bill increases\n"
-        "- No proactive communication during outages\n"
-        "- Mobile app crashes and broken usage graphs\n"
-        "- Long customer service hold times\n"
-        "- Smart meter installation delays and inaccurate readings\n\n"
+        f"**Summary:** {summary_sentence}\n\n"
+        f"**Top Issues:**\n{issue_lines}\n\n"
+        f"**NPS signal:** {detractor_count} of {total} respondents are detractors (score < 7).\n\n"
         "**Recommended Actions:**\n"
-        "1. Add real-time outage status notifications via SMS and app push.\n"
-        "2. Investigate and resolve mobile app stability on iOS.\n"
-        "3. Add a billing explainer that clearly breaks down each charge.\n\n"
+        "1. Investigate the top billing issue — check whether it is a presentation or calculation problem.\n"
+        "2. Review outage communication protocols and add proactive status notifications.\n"
+        "3. Audit the mobile app for the most common crash paths and prioritise the payment flow.\n\n"
         "---\n"
         "*This is the baseline output — one prompt, no classification, no clustering, "
-        "no scoring. Compare it against the full agentic pipeline output.*"
+        "no scoring.*"
     )
+
+
+# Backward-compatible alias — existing callers that use run_baseline still work.
+run_baseline = run_baseline_summary

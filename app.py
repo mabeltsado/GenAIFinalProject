@@ -626,39 +626,101 @@ if st.session_state.pipeline_done:
     with tab_baseline:
         st.subheader("Baseline vs. Agentic Pipeline")
         st.markdown(
-            "The **baseline** is a single LLM prompt that summarizes reviews and lists top issues — "
-            "the starting point the agentic pipeline improves on."
+            "The **baseline** uses a single prompt — "
+            "*'Summarize these customer reviews and list the top issues'* — "
+            "with no structure, no classification, and no scoring. "
+            "The **agentic pipeline** performs a fuller product triage process by cleaning data, "
+            "detecting duplicates, clustering themes, scoring opportunities, generating backlog "
+            "cards, and requiring human approval before any Trello action is taken. "
+            "The comparison below makes the difference concrete."
         )
 
+        # ── Comparison table ──────────────────────────────────────────────────
+        comparison_rows = [
+            {
+                "Capability":        "Structured output",
+                "Baseline":          "❌  Free-text summary only",
+                "Agentic Pipeline":  "✅  JSON classification with 8 fields per review",
+            },
+            {
+                "Capability":        "Duplicate handling",
+                "Baseline":          "❌  Duplicates counted as separate signals",
+                "Agentic Pipeline":  "✅  Exact-match and same-customer detection; excluded before analysis",
+            },
+            {
+                "Capability":        "Theme clustering",
+                "Baseline":          "❌  Issues listed as a flat bullet list",
+                "Agentic Pipeline":  "✅  Reviews grouped into named opportunity themes with NPS and severity stats",
+            },
+            {
+                "Capability":        "Evidence quotes",
+                "Baseline":          "❌  No quotes — summary only",
+                "Agentic Pipeline":  "✅  Verbatim quotes from reviews attached to each theme and card",
+            },
+            {
+                "Capability":        "Priority scoring",
+                "Baseline":          "❌  No ranking — all issues treated equally",
+                "Agentic Pipeline":  "✅  0–100 weighted score across 5 dimensions; goal-specific weights",
+            },
+            {
+                "Capability":        "Product insights brief",
+                "Baseline":          "❌  Generic summary; not aligned to a product goal",
+                "Agentic Pipeline":  "✅  Structured brief with executive summary, top opportunities, next steps, risks",
+            },
+            {
+                "Capability":        "Trello-ready cards",
+                "Baseline":          "❌  None generated",
+                "Agentic Pipeline":  "✅  Action-oriented cards with acceptance criteria, effort, and owner area",
+            },
+            {
+                "Capability":        "Human approval before action",
+                "Baseline":          "❌  Output goes directly to user with no review gate",
+                "Agentic Pipeline":  "✅  PM approves individual cards before any Trello creation",
+            },
+        ]
+
+        st.dataframe(
+            pd.DataFrame(comparison_rows).set_index("Capability"),
+            use_container_width=True,
+            height=330,
+        )
+
+        st.divider()
+
+        # ── Side-by-side outputs ──────────────────────────────────────────────
         col_b, col_a = st.columns(2)
 
         with col_b:
-            st.markdown("#### Baseline")
-            st.caption("One prompt → summary + bullet list")
-            if st.button("Run Baseline"):
+            st.markdown("#### Baseline Output")
+            st.caption("Prompt: *'Summarize these customer reviews and list the top issues.'*")
+            if st.button("▶ Run Baseline", key="run_baseline_btn"):
                 df_for_baseline = (
                     st.session_state.df_raw
                     if st.session_state.df_raw is not None
                     else pipeline.generate_sample_data()
                 )
-                st.session_state.baseline_out = pipeline.run_baseline(
+                st.session_state.baseline_out = pipeline.run_baseline_summary(
                     df_for_baseline, product_goal, use_mock=mock_mode
                 )
             if st.session_state.baseline_out:
                 st.markdown(st.session_state.baseline_out)
             else:
-                st.info("Click **Run Baseline** to generate the comparison output.")
+                st.info("Click **▶ Run Baseline** to generate the baseline output.")
 
         with col_a:
-            st.markdown("#### Agentic Pipeline")
-            st.caption("8 steps → classified themes, scores, brief, cards")
+            st.markdown("#### Agentic Pipeline Output")
+            st.caption("8 steps: validate → clean → deduplicate → classify → cluster → score → brief → cards")
             if st.session_state.brief:
                 st.markdown(st.session_state.brief)
+                n_cards = len(st.session_state.cards or [])
+                n_themes = len(st.session_state.themes or [])
                 st.caption(
-                    f"{len(st.session_state.cards or [])} backlog cards generated — see Trello Cards tab."
+                    f"{n_themes} themes identified · "
+                    f"{n_cards} backlog cards generated · "
+                    "See **Trello Cards** tab to review and approve."
                 )
             else:
-                st.info("Run the agent analysis first.")
+                st.info("Run the **▶ Run Agent Analysis** button above to generate the pipeline output.")
 
     # ── Evaluation Preview ────────────────────────────────────────────────────
 
